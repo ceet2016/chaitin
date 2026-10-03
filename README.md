@@ -94,7 +94,7 @@ X-SLCE-API-TOKEN: <token>
 
 流水线默认使用 **debug 签名**产出 APK，保证任何人都能直接安装体验。
 
-如需换成正式签名，在仓库「**设置 → 环境变量**」中添加下面 4 个变量即可，流水线会自动识别，无需改动配置：
+如需换成正式签名，需要 4 个变量：
 
 | 变量名 | 说明 |
 | --- | --- |
@@ -103,7 +103,30 @@ X-SLCE-API-TOKEN: <token>
 | `SIGNING_KEY_ALIAS` | 密钥别名 |
 | `SIGNING_KEY_PASSWORD` | 密钥密码 |
 
-> 密钥只以环境变量形式存在，不会落进版本库；构建产物也不会被回写。
+> ⚠️ CNB **没有**「仓库设置 → 环境变量」这个页面。变量通过**密钥仓库 + `imports`** 注入，
+> 具体步骤见下节。
+
+#### 配置步骤
+
+1. 进入 [新建仓库](https://cnb.cool/new/repos)，仓库类型选 **`密钥仓库`**
+   （密钥仓库禁止 clone 到本地，只能在网页上编辑，适合存密码）。
+2. 在其中新建 `signing.yml`：
+
+   ```yaml
+   allow_slugs: unicom/chaitin
+   SIGNING_KEYSTORE_BASE64: "<base64 -w0 keystore/safeline-client.jks 的输出>"
+   SIGNING_STORE_PASSWORD: "keystore 密码"
+   SIGNING_KEY_ALIAS: "别名"
+   SIGNING_KEY_PASSWORD: "密钥密码"
+   ```
+
+   `allow_slugs` 声明只有本仓库的流水线能读这个文件，避免其它项目蹭到密钥。
+3. 打开 `.cnb.yml`，把 `imports` 两行的注释去掉，链接换成上一步文件的 blob 地址（形如
+   `https://cnb.cool/<密钥仓库 slug>/-/blob/main/signing.yml`）。
+
+配好后下次 push，流水线会自动识别并改用正式签名；没配则继续走 debug 兜底。
+
+> 密钥只存在于密钥仓库，不会落进本仓库版本库；构建产物也不会被回写。
 
 ### 本地准备正式签名包
 

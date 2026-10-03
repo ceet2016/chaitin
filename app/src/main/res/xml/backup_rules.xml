@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude
+        domain="sharedpref"
+        path="safe_line_accounts.xml" />
+    <exclude
+        domain="file"
+        path="keystore_seed" />
+</full-backup-content>

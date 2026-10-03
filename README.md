@@ -9,6 +9,16 @@
 
 ---
 
+## 界面预览
+
+| 实例管理 | API Token 接入 | 安全态势仪表盘 |
+|:---:|:---:|:---:|
+| ![实例管理](docs/screenshot-accounts.jpg) | ![登录接入](docs/screenshot-login.jpg) | ![安全态势仪表盘](docs/screenshot-dashboard.jpg) |
+
+> 左：多实例管理，支持快速切换/新增/编辑/删除；中：API Token 接入，凭据由 Keystore 加密保存；右：仪表盘，展示攻击事件、拦截记录、人机验证等真实计数与实时 QPS、最新安全事件流。
+
+---
+
 ## 一、功能对照
 
 | 模块 | 客户端能力 | 说明 |

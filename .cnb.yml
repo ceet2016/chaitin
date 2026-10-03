@@ -1,0 +1,83 @@
+# 雷池 WAF 社区版 Android 客户端 —— 流水线配置
+# 目标：每次 push 自动构建 APK，并发布到 Release 供所有人下载。
+
+main:
+  push:
+    - name: build-apk
+      docker:
+        # 自建 Android 构建环境（JDK17 + Android SDK 34），见 ci/Dockerfile
+        build: ci/Dockerfile
+        volumes:
+          # 缓存 Gradle 依赖与构建产物，首次之后构建显著提速
+          - /root/.gradle
+      # 如需正式签名，在仓库「设置 → 环境变量」中添加下面 4 个变量即可，无需改动本文件：
+      #   SIGNING_KEYSTORE_BASE64  —— release.jks 的 base64 编码
+      #   SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD
+      # 未配置时自动回退为 debug 签名，保证产物仍可直接安装。
+      stages:
+        - name: 准备签名
+          script: |
+            if [ -n "$SIGNING_KEYSTORE_BASE64" ]; then
+              mkdir -p keystore
+              echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > keystore/release.jks
+              cat > keystore.properties <<PROP
+            storeFile=keystore/release.jks
+            storePassword=$SIGNING_STORE_PASSWORD
+            keyAlias=$SIGNING_KEY_ALIAS
+            keyPassword=$SIGNING_KEY_PASSWORD
+            PROP
+              echo "已写入正式签名配置"
+            else
+              echo "未配置签名密钥，将使用 debug 签名产出 APK（可直接安装）"
+            fi
+
+        - name: 构建 Release APK
+          script: |
+            chmod +x gradlew
+            ./gradlew --no-daemon :app:assembleRelease
+            ls -lh app/build/outputs/apk/release/
+
+        - name: 整理产物
+          script: |
+            mkdir -p dist
+            cp app/build/outputs/apk/release/app-release.apk dist/safeline-client.apk
+            cat > dist/build-info.txt <<INFO
+            commit: $CNB_COMMIT
+            branch: $CNB_BRANCH
+            build: https://cnb.cool/$CNB_REPO_SLUG/-/build/$CNB_BUILD_ID
+            time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            INFO
+            ls -lh dist/
+
+        - name: 发布到 Release
+          type: git:release
+          options:
+            # 固定 tag，下载地址稳定；每次 push 覆盖为最新构建
+            tag: nightly
+            title: 最新构建（Nightly）
+            description: |
+              由 main 分支最新提交自动构建的 APK，可直接下载安装。
+
+              - commit: $CNB_COMMIT
+              - 构建记录: https://cnb.cool/$CNB_REPO_SLUG/-/build/$CNB_BUILD_ID
+
+              下载下方 `safeline-client.apk` 安装即可（需允许「安装未知来源应用」）。
+            preRelease: true
+            latest: true
+            overlying: true
+
+        - name: 上传 APK 到 Release 附件
+          image: cnbcool/attachments
+          settings:
+            tag: nightly
+            attachments:
+              - "./dist/safeline-client.apk"
+              - "./dist/build-info.txt"
+            ttl: 0   # 0 表示永久保留
+
+        - name: 上传 APK 到本次提交
+          image: cnbcool/attachments
+          settings:
+            attachments:
+              - "./dist/safeline-client.apk"
+            ttl: 0

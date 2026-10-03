@@ -10,20 +10,35 @@ android {
     namespace = "xyz.anye.wafce"
     compileSdk = 34
 
-    // 签名信息从 keystore.properties 读取，避免把密码提交进版本库
+    // 签名信息优先级：keystore.properties（本地） > 环境变量（CI） > 无签名
     val keystorePropsFile = rootProject.file("keystore.properties")
-    val signingConfigured = keystorePropsFile.exists()
-    val signingProps = Properties().apply {
-        if (signingConfigured) keystorePropsFile.inputStream().use { load(it) }
+    val localSigningProps = Properties().apply {
+        if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
+    }
+
+    fun signingValue(key: String, envName: String): String? =
+        (localSigningProps.getProperty(key) ?: System.getenv(envName))?.takeIf { it.isNotBlank() }
+
+    // CI 下由流水线写入 keystore.properties，storeFile 用相对路径即可
+    val storeFilePath = signingValue("storeFile", "SIGNING_STORE_FILE")
+        ?.let { rootProject.file(it) }
+
+    val signingConfigured = storeFilePath?.exists() == true
+            && signingValue("storePassword", "SIGNING_STORE_PASSWORD") != null
+            && signingValue("keyAlias", "SIGNING_KEY_ALIAS") != null
+            && signingValue("keyPassword", "SIGNING_KEY_PASSWORD") != null
+
+    if (!signingConfigured) {
+        logger.lifecycle("[build] 未配置正式签名，release 包将使用 debug 签名")
     }
 
     signingConfigs {
         if (signingConfigured) {
             create("release") {
-                storeFile = file(signingProps["storeFile"] as String)
-                storePassword = signingProps["storePassword"] as String
-                keyAlias = signingProps["keyAlias"] as String
-                keyPassword = signingProps["keyPassword"] as String
+                storeFile = storeFilePath
+                storePassword = signingValue("storePassword", "SIGNING_STORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "SIGNING_KEY_ALIAS")
+                keyPassword = signingValue("keyPassword", "SIGNING_KEY_PASSWORD")
             }
         }
     }
@@ -70,7 +85,12 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = if (signingConfigured) signingConfigs.getByName("release") else null
+            // 未配置正式签名时用 debug 签名兜底，保证 CI 产物可直接安装
+            signingConfig = if (signingConfigured) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

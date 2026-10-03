@@ -10,9 +10,23 @@ main:
         volumes:
           # 缓存 Gradle 依赖与构建产物，首次之后构建显著提速
           - /root/.gradle
-      # 如需正式签名，在仓库「设置 → 环境变量」中添加下面 4 个变量即可，无需改动本文件：
-      #   SIGNING_KEYSTORE_BASE64  —— release.jks 的 base64 编码
-      #   SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD
+      # 【正式签名怎么配？】
+      # CNB 没有「仓库设置 → 环境变量」这个页面。要注入密钥，走密钥仓库 + imports：
+      #
+      #   1. 新建一个「密钥仓库」(https://cnb.cool/new/repos 里选仓库类型为 密钥仓库)
+      #   2. 在里面建 signing.yml，内容如下（allow_slugs 授权本仓库读取）：
+      #
+      #        allow_slugs: unicom/chaitin
+      #        SIGNING_KEYSTORE_BASE64: "<base64 -w0 keystore/release.jks 的输出>"
+      #        SIGNING_STORE_PASSWORD: "keystore 密码"
+      #        SIGNING_KEY_ALIAS: "别名"
+      #        SIGNING_KEY_PASSWORD: "密钥密码"
+      #
+      #   3. 把下面的 imports 换成该文件的 blob 链接（去掉行首注释）
+      #
+      # imports:
+      #   - https://cnb.cool/<你的密钥仓库 slug>/-/blob/main/signing.yml
+      #
       # 未配置时自动回退为 debug 签名，保证产物仍可直接安装。
       stages:
         - name: 准备签名

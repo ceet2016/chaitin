@@ -13,3 +13,6 @@
 /keystore/
 keystore.properties
 /dist
+# ADB 真机截图一律不入库（可能含服务器地址等敏感信息）
+screen-*.png
+/*.png

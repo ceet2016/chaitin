@@ -12,3 +12,4 @@
 # 签名证书与密码不应进版本库
 /keystore/
 keystore.properties
+/dist

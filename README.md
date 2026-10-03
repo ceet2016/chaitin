@@ -80,28 +80,67 @@ X-SLCE-API-TOKEN: <token>
 
 ---
 
-## 四、在本机构建
+## 四、下载 APK
 
-已在本机配置好的环境（无需 Android Studio）：
+每次推送 `main` 分支，流水线都会自动构建最新 APK 并发布：
+
+> **下载地址：** https://cnb.cool/unicom/chaitin/-/releases
+
+在 `nightly` 这个 Release 的附件里下载 `safeline-client.apk` 即可安装（需允许「安装未知来源应用」）。
+
+另外，每次提交的构建产物也会挂在该 commit 的附件上，方便回溯任意历史版本。
+
+### 关于签名
+
+流水线默认使用 **debug 签名**产出 APK，保证任何人都能直接安装体验。
+
+如需换成正式签名，在仓库「**设置 → 环境变量**」中添加下面 4 个变量即可，流水线会自动识别，无需改动配置：
+
+| 变量名 | 说明 |
+| --- | --- |
+| `SIGNING_KEYSTORE_BASE64` | `release.jks` 的 base64 编码（`base64 -w0 release.jks`） |
+| `SIGNING_STORE_PASSWORD` | keystore 密码 |
+| `SIGNING_KEY_ALIAS` | 密钥别名 |
+| `SIGNING_KEY_PASSWORD` | 密钥密码 |
+
+> 密钥只以环境变量形式存在，不会落进版本库；构建产物也不会被回写。
+
+### 本地准备正式签名包
 
 ```bash
-export JAVA_HOME="C:/Users/Administrator/.workbuddy/binaries/android/jdk17tmp/jdk-17.0.20.1+1"
-export ANDROID_HOME="C:/Users/Administrator/.workbuddy/binaries/android/sdk"
-
-cd C:/Users/Administrator/Desktop/test/SafeLineClient
-<gradle>/bin/gradle assembleRelease      # 签名正式包
-<gradle>/bin/gradle assembleDebug        # 调试包
+base64 -w0 keystore/safeline-client.jks   # 复制输出，填入 SIGNING_KEYSTORE_BASE64
 ```
-
-Gradle 位置：`C:/Users/Administrator/.workbuddy/binaries/android/dist/gradle-8.7/bin/gradle`
-
-技术栈版本：Kotlin 2.0.21 / AGP 8.5.2 / Compose BOM 2024.09.03 / OkHttp 4.12 / Retrofit 2.11 / targetSdk 34。
-
-签名密钥仓库于 `keystore/safeline-client.jks`，密码写在 `keystore.properties`（已被 gitignore，不要入库）。
 
 ---
 
-## 五、目录结构
+## 五、在本机构建
+
+准备好 **JDK 17** 与 **Android SDK（platform 34 / build-tools 34.0.0）**，然后：
+
+```bash
+./gradlew assembleRelease   # 正式包（未配签名时用 debug 签名兜底）
+./gradlew assembleDebug     # 调试包
+```
+
+产物路径：`app/build/outputs/apk/release/app-release.apk`
+
+技术栈版本：Kotlin 2.0.21 / AGP 8.5.2 / Compose BOM 2024.09.03 / OkHttp 4.12 / Retrofit 2.11 / targetSdk 34。
+
+签名密钥放在 `keystore/safeline-client.jks`，路径与密码写进 `keystore.properties`（已被 gitignore，不要入库）：
+
+```properties
+storeFile=keystore/safeline-client.jks
+storePassword=...
+keyAlias=...
+keyPassword=...
+```
+
+> 未提供 `keystore.properties` 时，`assembleRelease` 会自动退回 **debug 签名**，
+> 保证本地和 CI 都能直接产出可安装的 APK。
+
+---
+
+## 六、目录结构
 
 ```
 app/src/main/kotlin/xyz/anye/wafce/
@@ -119,7 +158,7 @@ app/src/main/kotlin/xyz/anye/wafce/
 
 ---
 
-## 六、已知限制
+## 七、已知限制
 
 1. `global/mode`、`global/acl` 属控制台内部接口，字段名随版本可能变化，因此客户端采用「读取原始 JSON + 专家模式下发」的设计，而非硬编码开关 UI。
 2. API Token 模式下，控制台未授权到该 Token 的模块会返回空数据或错误。

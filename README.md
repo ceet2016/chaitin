@@ -90,6 +90,79 @@ X-SLCE-API-TOKEN: <token>
 
 另外，每次提交的构建产物也会挂在该 commit 的附件上，方便回溯任意历史版本。
 
+### 第一步：生成你的签名证书（本地）
+
+Android 要求每个 APK 用开发者自己的私钥签名。没配签名时 Gradle 会用 **debug 签名**兜底
+（能装，但换机器/换环境签名就变，用户升级时必须卸载重装），所以正式分发前请生成自己的证书。
+
+**① 用 keytool 生成 keystore**（JDK 自带，无需额外安装）：
+
+```bash
+# 换成你自己的 JDK 路径
+JDK="C:/Users/Administrator/.workbuddy/binaries/android/jdk17tmp/jdk-17.0.20.1+1"
+mkdir -p keystore
+
+"$JDK/bin/keytool" -genkeypair -v \
+  -keystore keystore/safeline-client.jks \
+  -storetype PKCS12 \
+  -keyalg RSA -keysize 2048 \
+  -validity 10950 \
+  -alias safeline \
+  -storepass "换成你的密码" \
+  -keypass   "换成你的密码" \
+  -dname "CN=yourdomain.com, OU=Tools, O=YourName, L=City, ST=Province, C=CN"
+```
+
+参数说明：
+
+| 参数 | 建议 |
+| --- | --- |
+| `-storetype PKCS12` | 推荐，比老式 JKS 更安全、兼容性更好（AGP 7+ 均支持） |
+| `-keyalg RSA -keysize 2048` | 标准配置，兼顾兼容与安全 |
+| `-validity 10950` | 30 年。Google Play 要求有效期晚于 2033-10-22，太短会影响上架 |
+| `-alias` | 密钥别名，一个 keystore 可放多把密钥 |
+| `-dname` | 证书主体信息，会显示给安装者（CN 一般是域名或姓名） |
+
+**② 把路径与密码写进 `keystore.properties`**（该文件已被 gitignore，不会入库）：
+
+```properties
+storeFile=keystore/safeline-client.jks
+storePassword=<上一步的 storepass>
+keyAlias=safeline
+keyPassword=<上一步的 keypass>
+```
+
+> ⚠️ **路径陷阱**：`storeFile` 是相对于**项目根目录**解析的（Gradle 里用的是
+> `rootProject.file(...)`），**不是** `app/` 目录。写成 `../keystore/xxx.jks` 或
+> `app/keystore/xxx.jks` 都会找不到文件，从而静默退回 debug 签名——
+> 构建不会报错，但签名其实没生效。
+
+**③ 构建并验证签名确实生效**：
+
+```bash
+export JAVA_HOME="C:/.../jdk-17.0.20.1+1"
+export ANDROID_HOME="C:/.../android/sdk"
+./gradlew assembleRelease
+
+# 验证：应显示你自己的 DN，而不是 Android Debug
+"$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs \
+  app/build/outputs/apk/release/app-release.apk
+```
+
+看到 `Signer #1 certificate DN: CN=yourdomain.com, ...` 即成功；
+若出现 `CN=Android Debug` 说明没配上，回去检查 `storeFile` 路径。
+
+**④ 查看已有证书信息（可选）**：
+
+```bash
+"$JDK/bin/keytool" -list -v -keystore keystore/safeline-client.jks -storepass "<密码>"
+```
+
+> 🔒 **务必备份**：keystore 文件 + 两个密码一旦丢失，**无法再为这个应用发布更新**
+> （用户只能卸载重装，且无法覆盖升级）。建议离线备份，且不要提交进任何仓库。
+
+---
+
 ### 关于签名
 
 流水线默认使用 **debug 签名**产出 APK，保证任何人都能直接安装体验。
@@ -159,7 +232,8 @@ keyPassword=...
 ```
 
 > 未提供 `keystore.properties` 时，`assembleRelease` 会自动退回 **debug 签名**，
-> 保证本地和 CI 都能直接产出可安装的 APK。
+> 保证本地和 CI 都能直接产出可安装的 APK。证书的生成方法见上文
+> [第一步：生成你的签名证书](#第一步生成你的签名证书本地)。
 
 ---
 

@@ -13,13 +13,14 @@ import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -58,8 +59,10 @@ import com.uniomo.wafce.ui.screens.SiteDetailScreen
 import com.uniomo.wafce.ui.screens.SitesScreen
 import com.uniomo.wafce.ui.screens.SystemScreen
 import com.uniomo.wafce.ui.theme.SafeLineTheme
+import com.uniomo.wafce.ui.components.UpdateDialog
 import com.uniomo.wafce.vm.AppViewModel
 import com.uniomo.wafce.vm.SessionState
+import com.uniomo.wafce.vm.UpdateVm
 
 object Route {
     const val Dashboard = "dashboard"
@@ -102,6 +105,7 @@ fun AppRoot(vm: AppViewModel) {
 @Composable
 private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
     val nav = rememberNavController()
+    val updateVm: UpdateVm = viewModel()
     val backStack by nav.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     var sheetOpen by remember { mutableStateOf(false) }
@@ -130,8 +134,8 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
                     }
                 },
                 actions = {
-                    IconButton(onClick = { nav.navigate(Route.About) }) {
-                        Icon(Icons.Default.Info, contentDescription = "关于")
+                    IconButton(onClick = { updateVm.check() }) {
+                        Icon(Icons.Default.SystemUpdate, contentDescription = "检查更新")
                     }
                     IconButton(onClick = { vm.reload(); vm.ensureCurrentSession() }) {
                         Icon(Icons.Default.Refresh, contentDescription = "刷新")
@@ -179,6 +183,13 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
             }
         }
     }
+
+    UpdateDialog(
+        state = updateVm.state,
+        onDismiss = { updateVm.dismiss() },
+        onInstall = { updateVm.install() },
+        onRetry = { updateVm.check() }
+    )
 
     if (sheetOpen) {
         AccountSwitcherSheet(

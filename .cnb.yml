@@ -24,8 +24,8 @@ main:
       #
       #   3. 把下面的 imports 换成该文件的 blob 链接（去掉行首注释）
       #
-      # imports:
-      #   - https://cnb.cool/<你的密钥仓库 slug>/-/blob/main/signing.yml
+       imports:
+         - https://cnb.cool/unicom/unicom/-/blob/main/signing.yml
       #
       # 未配置时自动回退为 debug 签名，保证产物仍可直接安装。
       stages:

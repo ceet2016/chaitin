@@ -28,7 +28,30 @@ object UpdateManager {
     const val APK_URL =
         "https://cnb.cool/unicom/chaitin/-/releases/download/nightly/safeline-client.apk"
 
+    /** 版本清单：只有几百字节，检查更新时先取它，避免白白下载 12MB APK */
+    const val VERSION_URL =
+        "https://cnb.cool/unicom/chaitin/-/releases/download/nightly/version.json"
+
     data class ApkInfo(val versionCode: Long, val versionName: String, val file: File)
+
+    /** 拉取版本清单（轻量）。404 时返回 null，调用方据此回退 */
+    suspend fun fetchLatest(): ApkInfo? = withContext(Dispatchers.IO) {
+        val client = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .build()
+        runCatching {
+            client.newCall(Request.Builder().url(VERSION_URL).build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val text = resp.body?.string().orEmpty()
+                val code = Regex("\"versionCode\"\\s*:\\s*(\\d+)").find(text)
+                    ?.groupValues?.get(1)?.toLongOrNull() ?: return@runCatching null
+                val name = Regex("\"versionName\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                    ?.groupValues?.get(1) ?: ""
+                ApkInfo(code, name, File(""))
+            }
+        }.getOrNull()
+    }
 
     /** 当前已安装版本的 versionCode */
     fun currentCode(context: Context): Long = try {

@@ -118,14 +118,14 @@ fun UpdateDialog(
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "安装包已下载完成，点击下方安装即可，无需卸载旧版本。",
+                        "点击下方按钮才会开始下载安装包（约 12MB），完成后自动调起安装，无需卸载旧版本。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = onInstall) { Text("立即安装") }
+                TextButton(onClick = onInstall) { Text("下载并安装") }
             },
             dismissButton = {
                 TextButton(onClick = onDismiss) { Text("稍后") }

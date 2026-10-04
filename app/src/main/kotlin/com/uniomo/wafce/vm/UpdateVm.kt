@@ -25,8 +25,6 @@ class UpdateVm(app: Application) : AndroidViewModel(app) {
     var state: UpdateState by mutableStateOf(UpdateState.Idle)
         private set
 
-    /** 已下载待安装的 APK，点击确认后使用 */
-    private var pendingFile: java.io.File? = null
     private var running = false
 
     fun dismiss() {
@@ -35,8 +33,9 @@ class UpdateVm(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 检查更新：下载 APK → 解析版本 → 比较。
-     * 只有 versionCode 严格大于当前版本才提示安装。
+     * 检查更新：只拉取几百字节的版本清单做比较，**不下载 APK**。
+     * 清单缺失（例如流水线尚未发布 version.json）时，
+     * 回退为「下载 APK 解析版本」的老办法，保证功能可用。
      */
     fun check() {
         if (running) return
@@ -47,19 +46,27 @@ class UpdateVm(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             state = try {
-                val file = UpdateManager.download(ctx) { pct ->
-                    state = UpdateState.Downloading(pct)
-                }
-                val info = UpdateManager.parse(ctx, file)
-                if (info == null) {
-                    UpdateManager.clear(ctx)
-                    UpdateState.Failed("无法解析安装包，请稍后重试")
-                } else if (info.versionCode > current) {
-                    pendingFile = file
-                    UpdateState.Found(info.versionName, info.versionCode)
+                val latest = UpdateManager.fetchLatest()
+                if (latest != null) {
+                    if (latest.versionCode > current) {
+                        UpdateState.Found(latest.versionName, latest.versionCode)
+                    } else {
+                        UpdateState.UpToDate
+                    }
                 } else {
-                    UpdateManager.clear(ctx)
-                    UpdateState.UpToDate
+                    // 回退：没有清单就只能下 APK 看版本
+                    val file = UpdateManager.download(ctx) { pct -> state = UpdateState.Downloading(pct) }
+                    val info = UpdateManager.parse(ctx, file)
+                    if (info == null) {
+                        UpdateManager.clear(ctx)
+                        UpdateState.Failed("无法解析安装包，请稍后重试")
+                    } else if (info.versionCode > current) {
+                        pendingFile = file
+                        UpdateState.Found(info.versionName, info.versionCode)
+                    } else {
+                        UpdateManager.clear(ctx)
+                        UpdateState.UpToDate
+                    }
                 }
             } catch (e: Exception) {
                 UpdateManager.clear(ctx)
@@ -69,9 +76,29 @@ class UpdateVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 用户确认安装 */
+    /** 用户确认后才真正下载 APK，下完立即调起安装 */
     fun install() {
-        val file = pendingFile ?: return
+        if (running) return
+        val cached = pendingFile
+        if (cached != null && cached.exists()) {
+            doInstall(cached)
+            return
+        }
+        running = true
+        val ctx = getApplication<Application>()
+        viewModelScope.launch {
+            try {
+                val file = UpdateManager.download(ctx) { pct -> state = UpdateState.Downloading(pct) }
+                doInstall(file)
+            } catch (e: Exception) {
+                UpdateManager.clear(ctx)
+                state = UpdateState.Failed(e.message ?: "下载失败")
+            }
+            running = false
+        }
+    }
+
+    private fun doInstall(file: java.io.File) {
         val ctx = getApplication<Application>()
         state = UpdateState.Installing
         runCatching {
@@ -80,4 +107,6 @@ class UpdateVm(app: Application) : AndroidViewModel(app) {
             state = UpdateState.Failed("调起安装失败：${it.message ?: "未知错误"}")
         }
     }
+
+    private var pendingFile: java.io.File? = null
 }

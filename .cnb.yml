@@ -48,6 +48,11 @@ main:
         - name: 构建 Release APK
           script: |
             chmod +x gradlew
+            # 必须先记录本次产物版本：构建结束后 bumpVersion 会把 version.properties +1，
+            # 那时再读就变成「下一个版本」了。
+            grep '^versionCode=' version.properties | cut -d= -f2 > .build_vcode
+            grep '^versionName=' version.properties | cut -d= -f2 > .build_vname
+            echo "本次构建版本: $(cat .build_vname) ($(cat .build_vcode))"
             ./gradlew --no-daemon :app:assembleRelease
             ls -lh app/build/outputs/apk/release/
 
@@ -55,12 +60,21 @@ main:
           script: |
             mkdir -p dist
             cp app/build/outputs/apk/release/app-release.apk dist/safeline-client.apk
+            VC=$(cat .build_vcode 2>/dev/null || echo 0)
+            VN=$(cat .build_vname 2>/dev/null || echo unknown)
+            # 供 App 内置「检查更新」先取这个小文件比对版本，避免每次都下 12MB APK
+            cat > dist/version.json <<VJSON
+            {"versionCode":$VC,"versionName":"$VN","commit":"$CNB_COMMIT","time":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")","apkUrl":"https://cnb.cool/$CNB_REPO_SLUG/-/releases/download/nightly/safeline-client.apk"}
+            VJSON
             cat > dist/build-info.txt <<INFO
             commit: $CNB_COMMIT
             branch: $CNB_BRANCH
             build: https://cnb.cool/$CNB_REPO_SLUG/-/build/$CNB_BUILD_ID
             time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            version: $VN ($VC)
             INFO
+            echo "--- version.json ---"
+            cat dist/version.json
             ls -lh dist/
 
         - name: 发布到 Release
@@ -86,6 +100,7 @@ main:
             tag: nightly
             attachments:
               - "./dist/safeline-client.apk"
+              - "./dist/version.json"
               - "./dist/build-info.txt"
             ttl: 0   # 0 表示永久保留
 

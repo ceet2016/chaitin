@@ -95,7 +95,22 @@ X-SLCE-API-TOKEN: <token>
 Android 要求每个 APK 用开发者自己的私钥签名。没配签名时 Gradle 会用 **debug 签名**兜底
 （能装，但换机器/换环境签名就变，用户升级时必须卸载重装），所以正式分发前请生成自己的证书。
 
-**① 用 keytool 生成 keystore**（JDK 自带，无需额外安装）：
+**方式 A（推荐）：用一键脚本**
+
+仓库自带 `scripts/generate-signing.sh`，只需两步：
+
+1. 编辑 `keystore/signing.env`，填写证书信息与两个密码（该文件**不会入库**）
+2. 在项目根目录执行：
+
+```bash
+bash scripts/generate-signing.sh
+```
+
+脚本会生成 `keystore/safeline-client.jks` 并自动写好 `keystore.properties`。
+若证书已存在会先要求输入 `yes` 确认，避免误覆盖（覆盖会导致已安装的 App 无法覆盖升级）。
+JDK 不在默认路径时：`JDK_BIN=/path/to/jdk bash scripts/generate-signing.sh`。
+
+**方式 B：手动执行 keytool**（脚本做的事就是这些）
 
 ```bash
 # 换成你自己的 JDK 路径

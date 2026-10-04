@@ -216,7 +216,7 @@ export ANDROID_HOME="C:/.../android/sdk"
 
    ```yaml
    allow_slugs: unicom/chaitin
-   SIGNING_KEYSTORE_BASE64: "<base64 -w0 keystore/safeline-client.jks 的输出>"
+   SIGNING_KEYSTORE_BASE64: "<用 scripts\export-keystore-base64.ps1 导出的那串>"
    SIGNING_STORE_PASSWORD: "keystore 密码"
    SIGNING_KEY_ALIAS: "别名"
    SIGNING_KEY_PASSWORD: "密钥密码"
@@ -232,9 +232,26 @@ export ANDROID_HOME="C:/.../android/sdk"
 
 ### 本地准备正式签名包
 
-```bash
-base64 -w0 keystore/safeline-client.jks   # 复制输出，填入 SIGNING_KEYSTORE_BASE64
+PowerShell（Windows 推荐，顺带复制到剪贴板）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\export-keystore-base64.ps1
 ```
+
+等价的一条命令写法：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("keystore\safeline-client.jks")) | Set-Clipboard
+```
+
+Git Bash / Linux：
+
+```bash
+base64 -w0 keystore/safeline-client.jks
+```
+
+> ⚠️ 这串 base64 **等同于你的私钥**（只差密码），不要提交进仓库、不要贴到 issue 或聊天里。
+> 上面的脚本只写入 `keystore/keystore.b64.txt`（已被 gitignore）并复制到剪贴板。
 
 ---
 

@@ -97,10 +97,16 @@ Android 要求每个 APK 用开发者自己的私钥签名。没配签名时 Gra
 
 **方式 A（推荐）：用一键脚本**
 
-仓库自带 `scripts/generate-signing.sh`，只需两步：
+仓库自带生成脚本，只需两步：
 
 1. 编辑 `keystore/signing.env`，填写证书信息与两个密码（该文件**不会入库**）
-2. 在项目根目录执行：
+2. 在项目根目录执行（**PowerShell**，Windows 下推荐）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\generate-signing.ps1
+```
+
+或在 Git Bash 里：
 
 ```bash
 bash scripts/generate-signing.sh
@@ -108,7 +114,15 @@ bash scripts/generate-signing.sh
 
 脚本会生成 `keystore/safeline-client.jks` 并自动写好 `keystore.properties`。
 若证书已存在会先要求输入 `yes` 确认，避免误覆盖（覆盖会导致已安装的 App 无法覆盖升级）。
-JDK 不在默认路径时：`JDK_BIN=/path/to/jdk bash scripts/generate-signing.sh`。
+
+> 两个脚本功能一致，任选其一。**PowerShell 5.1 会按系统 ANSI 编码读取无 BOM 的脚本**，
+> 因此 `.ps1` 内保持纯 ASCII 输出（中文放在 `.env` 里，用 UTF-8 读取）。
+
+JDK 不在默认路径时：
+
+```powershell
+$env:JDK_BIN="D:\jdk17"; powershell -ExecutionPolicy Bypass -File scripts\generate-signing.ps1
+```
 
 **方式 B：手动执行 keytool**（脚本做的事就是这些）
 

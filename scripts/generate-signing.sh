@@ -37,8 +37,9 @@ if [ ! -x "$KEYTOOL" ] && [ ! -f "$KEYTOOL" ]; then
   exit 1
 fi
 
-if grep -q "请改成你的密码" "$ENV_FILE"; then
-  echo "[X] Please set STORE_PASSWORD and KEY_PASSWORD first (search: 请改成你的密码)"
+if grep -q "TODO_SET_YOUR_PASSWORD" "$ENV_FILE"; then
+  echo "[X] Please set STORE_PASSWORD and KEY_PASSWORD in $ENV_FILE first"
+  echo "    (replace TODO_SET_YOUR_PASSWORD with your own password)"
   exit 1
 fi
 

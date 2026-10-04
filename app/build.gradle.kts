@@ -78,6 +78,8 @@ android {
 
     buildFeatures {
         compose = true
+        // AGP 8 默认不生成 BuildConfig，关于页需要读 VERSION_NAME / VERSION_CODE
+        buildConfig = true
     }
 
     packaging {

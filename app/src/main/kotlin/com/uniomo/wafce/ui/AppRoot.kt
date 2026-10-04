@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
@@ -47,6 +48,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.uniomo.wafce.data.store.AccountProfile
+import com.uniomo.wafce.ui.screens.AboutScreen
 import com.uniomo.wafce.ui.screens.AccountsScreen
 import com.uniomo.wafce.ui.screens.DashboardScreen
 import com.uniomo.wafce.ui.screens.LoginScreen
@@ -65,6 +67,7 @@ object Route {
     const val Protect = "protect"
     const val Logs = "logs"
     const val System = "system"
+    const val About = "about"
     const val SiteDetail = "site/{id}"
 }
 
@@ -127,6 +130,9 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { nav.navigate(Route.About) }) {
+                        Icon(Icons.Default.Info, contentDescription = "关于")
+                    }
                     IconButton(onClick = { vm.reload(); vm.ensureCurrentSession() }) {
                         Icon(Icons.Default.Refresh, contentDescription = "刷新")
                     }
@@ -162,6 +168,9 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
             composable(Route.Protect) { ProtectScreen(account) }
             composable(Route.Logs) { LogsScreen(account) }
             composable(Route.System) { SystemScreen(account, vm) }
+            composable(Route.About) {
+                AboutScreen(account = account, appVm = vm) { nav.popBackStack() }
+            }
             composable(
                 route = Route.SiteDetail,
                 arguments = listOf(navArgument("id") { type = NavType.LongType })

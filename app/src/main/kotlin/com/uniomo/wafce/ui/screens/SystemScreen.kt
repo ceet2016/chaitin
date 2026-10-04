@@ -317,7 +317,7 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel) {
                     onDelete = { vm.deleteToken(account) }
                 )
                 "notice" -> ListArea(vm.notices, "暂无通知策略", { vm.loadNotices(account) })
-                "system" -> AboutArea(vm, account, appVm)
+                "system" -> AboutScreen(account = account, appVm = appVm)
             }
         }
     }
@@ -426,75 +426,6 @@ private fun formatTs(sec: Long): String = try {
     java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault()).format(java.util.Date(ms))
 } catch (e: Exception) {
     sec.toString()
-}
-
-@Composable
-private fun AboutArea(vm: SystemVm, account: AccountProfile, appVm: AppViewModel) {
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(bottom = 32.dp)
-    ) {
-        when (val s = vm.system) {
-            UiState.Idle, UiState.Loading -> Box(
-                Modifier.fillMaxWidth().padding(24.dp),
-                contentAlignment = Alignment.Center
-            ) { CircularProgressIndicator(modifier = Modifier.size(26.dp), strokeWidth = 2.5.dp) }
-
-            is UiState.Fail -> ErrorBox(message = s.message, onRetry = { vm.loadSystem(account) })
-
-            is UiState.Success -> {
-                val info = s.data
-                SectionCard("引擎信息") {
-                    KeyValueRow("版本", Resp.str(info, "version").ifBlank { "未知" })
-                    KeyValueRow("控制台地址", account.baseUrl.trimEnd('/'))
-                    info.keySet().filter { it != "version" }.forEach { k ->
-                        val v = info.get(k)
-                        if (v.isJsonPrimitive) KeyValueRow(k, v.asString)
-                    }
-                }
-            }
-        }
-
-        if (vm.unsupported.isNotEmpty()) {
-            SectionCard("当前版本不可用模块", subtitle = "该控制台未开放以下接口，已自动隐藏") {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    vm.unsupported.forEach { k ->
-                        val label = ALL_TABS.firstOrNull { it.key == k }?.label ?: k
-                        TagChip(text = label, color = Warn)
-                    }
-                }
-            }
-        }
-
-        SectionCard("账号") {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(account.name.ifBlank { account.baseUrl }, style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        account.baseUrl,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                TextButton(onClick = { appVm.logout() }) {
-                    Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.size(4.dp))
-                    Text("退出")
-                }
-            }
-        }
-        SectionCard("说明") {
-            Text(
-                "本客户端为社区版第三方管理工具，功能依赖雷池控制台接口与 Token 权限。" +
-                    "控制台版本未开放的接口会自动隐藏而非报错。" +
-                    "修改防护配置可能影响线上业务，请在灰度环境验证后操作。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
 }
 
 @Composable

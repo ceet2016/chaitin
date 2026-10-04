@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -223,6 +224,8 @@ fun SitesScreen(account: AccountProfile, nav: NavHostController) {
     }
 
     Scaffold(
+        // 外层 MainScaffold 已处理系统栏，这里清零避免重复叠加导致顶部留白
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         floatingActionButton = {
             FloatingActionButton(onClick = { vm.openNew() }) {
                 Icon(Icons.Default.Add, contentDescription = "新增站点")

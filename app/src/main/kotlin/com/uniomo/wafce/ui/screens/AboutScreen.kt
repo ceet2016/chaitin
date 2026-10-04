@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Description
@@ -98,6 +99,21 @@ fun AboutScreen(
                 .padding(horizontal = 20.dp, vertical = 22.dp)
         ) {
             Column(Modifier.fillMaxWidth()) {
+                // 从主界面顶栏进入时才显示返回（系统管理页签内不需要）
+                if (onBack != null) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "返回",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
@@ -224,7 +240,10 @@ fun AboutScreen(
     }
 }
 
-/** 纯展示行 */
+/**
+ * 纯展示行 —— 与 [LinkRow] 使用完全相同的 Card 容器与内边距，
+ * 保证同一分组内的图标与文字左右对齐（之前裸 Row 会差 12dp 内边距）。
+ */
 @Composable
 private fun InfoRow(
     icon: ImageVector,
@@ -232,32 +251,40 @@ private fun InfoRow(
     value: String,
     tint: Color
 ) {
-    Row(
-        Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = CardShape,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .background(tint.copy(alpha = 0.14f), CardShape),
-            contentAlignment = Alignment.Center
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(17.dp))
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                value,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .background(tint.copy(alpha = 0.14f), CardShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(17.dp))
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    value,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }

@@ -7,7 +7,7 @@ plugins {
 }
 
 android {
-    namespace = "xyz.anye.wafce"
+    namespace = "com.uniomo.wafce"
     compileSdk = 34
 
     // 签名信息优先级：keystore.properties（本地） > 环境变量（CI） > 无签名
@@ -43,12 +43,21 @@ android {
         }
     }
 
+    // 版本号集中放在项目根目录的 version.properties，构建成功后自动 +1
+    val versionPropsFile = rootProject.file("version.properties")
+    val versionProps = Properties().apply {
+        if (versionPropsFile.exists()) versionPropsFile.inputStream().use { load(it) }
+        else setProperty("versionCode", "1").also { setProperty("versionName", "1.0.0") }
+    }
+    val appVersionCode = versionProps.getProperty("versionCode", "1").toInt()
+    val appVersionName = versionProps.getProperty("versionName", "1.0.0")
+
     defaultConfig {
-        applicationId = "xyz.anye.wafce"
+        applicationId = "com.uniomo.wafce"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         resourceConfigurations += setOf("zh", "en")
     }
@@ -126,4 +135,45 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     testImplementation("junit:junit:4.13.2")
+}
+
+// ------------------------------------------------------------------
+// 版本号自动递增
+//
+// 规则：release 构建成功后，version.properties 里的 versionCode +1，
+//       versionName 的修订号（第三段）+1，例如 1.0.3 -> 1.0.4。
+// 这样每次打包都是新版本号，安装时可覆盖升级，不会出现「装不上」的情况。
+// ------------------------------------------------------------------
+tasks.register("bumpVersion") {
+    doLast {
+        val file = rootProject.file("version.properties")
+        val props = Properties().apply {
+            if (file.exists()) file.inputStream().use { load(it) }
+        }
+        val oldCode = props.getProperty("versionCode", "1").toInt()
+        val oldName = props.getProperty("versionName", "1.0.0")
+        val newCode = oldCode + 1
+        val newName = bumpPatch(oldName)
+
+        props.setProperty("versionCode", newCode.toString())
+        props.setProperty("versionName", newName)
+        file.outputStream().use { props.store(it, "auto bumped by bumpVersion task") }
+
+        logger.lifecycle("[version] $oldName ($oldCode) -> $newName ($newCode)")
+    }
+}
+
+fun bumpPatch(name: String): String {
+    val parts = name.trim().split(".").toMutableList()
+    while (parts.size < 3) parts.add("0")
+    val patch = parts[2].toIntOrNull() ?: 0
+    parts[2] = (patch + 1).toString()
+    return parts.take(3).joinToString(".")
+}
+
+// assembleRelease 成功后才递增，避免构建失败也把版本号吃掉。
+// AGP 的变体任务是延迟创建的，必须用 matching 而不是 named，否则报
+// "Task with name 'assembleRelease' not found"。
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy("bumpVersion")
 }

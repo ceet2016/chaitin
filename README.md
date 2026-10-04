@@ -3,7 +3,7 @@
 面向 [雷池 SafeLine 社区版](https://waf-ce.chaitin.cn/) 的原生安卓管理客户端。
 使用 Kotlin + Jetpack Compose + Material 3 编写，**支持多实例（多账号）快速切换**，凭据由 Android Keystore 加密落盘。
 
-- 包名：`xyz.anye.wafce`
+- 包名：`com.uniomo.wafce`
 - 最低支持：Android 8.0（API 26）
 - 构建产物：`app/build/outputs/apk/release/app-release.apk`
 
@@ -265,6 +265,29 @@ base64 -w0 keystore/safeline-client.jks
 ```
 
 产物路径：`app/build/outputs/apk/release/app-release.apk`
+
+### 版本号自动递增
+
+版本号集中维护在项目根目录的 `version.properties`：
+
+```properties
+versionCode=2
+versionName=1.0.1
+```
+
+每次 `./gradlew assembleRelease` **成功后**，`bumpVersion` 任务会自动把它改成下一个版本
+（`versionCode` +1，`versionName` 修订号 +1，如 `1.0.1 -> 1.0.2`），构建日志里会打印一行：
+
+```
+[version] 1.0.1 (2) -> 1.0.2 (3)
+```
+
+好处：每次打包都是新版本号，装到手机上能直接覆盖升级，不会出现「版本号没变装不上」的情况。
+
+想跳大版本就手动编辑该文件（例如改成 `2.0.0`）；只在构建成功时递增，构建失败不会吃掉版本号。
+
+> CI 环境每次都是干净检出，写回的 `version.properties` 不会提交，
+> 因此流水线产物始终用仓库里记录的版本号。需要按次递增的话，把变更提交回仓库即可。
 
 技术栈版本：Kotlin 2.0.21 / AGP 8.5.2 / Compose BOM 2024.09.03 / OkHttp 4.12 / Retrofit 2.11 / targetSdk 34。
 

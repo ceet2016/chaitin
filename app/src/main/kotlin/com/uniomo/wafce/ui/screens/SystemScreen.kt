@@ -19,7 +19,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -46,6 +49,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -77,6 +82,20 @@ import com.uniomo.wafce.vm.AppViewModel
 import com.uniomo.wafce.vm.UpdateVm
 
 data class SysTab(val key: String, val label: String)
+
+/**
+ * 用户新增/编辑表单。
+ * [id] 为 0 表示新增，否则为编辑。[password] 留空表示不修改密码。
+ *
+ * 可见性必须与 SysTab 一致为public：ViewModel 的 userEditor / saveUser 都是
+ * public 成员，声明成 private 会触发「exposes its private-in-file type」。
+ */
+data class UserEdit(
+    val id: Long,
+    val username: String,
+    val password: String,
+    val role: String
+)
 
 private val ALL_TABS = listOf(
     SysTab("cert", "证书"),
@@ -255,6 +274,104 @@ class SystemVm : ViewModel() {
     fun openCertEditor() { certEditorOpen = true }
     fun closeCertEditor() { certEditorOpen = false }
 
+    // ---------------- 用户管理 ----------------
+    // 官方 OpenAPI 已声明 /open/users 的增删改（POST / PUT /{id} / DELETE /{id}），
+    // 此前只做了只读列表，导致该页签看得见却改不了，属于功能缺口。
+
+    /** 待删除的用户；非 null 时 UI 层弹出二次确认 */
+    var pendingUserDelete by mutableStateOf<JsonObject?>(null)
+        private set
+
+    /** 非 null 时打开用户编辑弹窗；携带 id 表示编辑，否则为新增 */
+    var userEditor by mutableStateOf<UserEdit?>(null)
+        private set
+
+    fun openUserCreate() {
+        userEditor = UserEdit(id = 0L, username = "", password = "", role = "")
+    }
+
+    fun openUserEdit(item: JsonObject) {
+        val id = Resp.l(item, "id")
+        if (id <= 0L) {
+            message = "该用户缺少 id，无法编辑"
+            return
+        }
+        userEditor = UserEdit(
+            id = id,
+            username = Resp.str(item, "username", "name", "account"),
+            password = "",
+            role = Resp.str(item, "role", "role_name")
+        )
+    }
+
+    fun closeUserEditor() { userEditor = null }
+
+    fun requestDeleteUser(item: JsonObject) { pendingUserDelete = item }
+    fun cancelDeleteUser() { pendingUserDelete = null }
+
+    /**
+     * 提交用户新增或修改。
+     * 编辑时密码留空表示不改密码——官方接口对空password 的语义不明确，
+     * 这里显式不带该字段，避免把用户已有密码清空导致其无法登录。
+     */
+    fun saveUser(account: AccountProfile, edit: UserEdit) {
+        val uname = edit.username.trim()
+        if (uname.isEmpty()) {
+            message = "用户名不能为空"
+            return
+        }
+        if (edit.id <= 0L && edit.password.isEmpty()) {
+            message = "新增用户必须设置密码"
+            return
+        }
+        viewModelScope.launch {
+            working = true
+            message = try {
+                val api = ApiClient.apiFor(account)
+                val body = JsonObject().apply {
+                    addProperty("username", uname)
+                    if (edit.password.isNotEmpty()) addProperty("password", edit.password)
+                    if (edit.role.isNotBlank()) addProperty("role", edit.role.trim())
+                }
+                if (edit.id <= 0L) {
+                    api.createUser(body)
+                    "用户 $uname 已创建"
+                } else {
+                    api.updateUser(edit.id, body)
+                    "用户 $uname 已更新"
+                }.also {
+                    userEditor = null
+                    loadUsers(account)
+                }
+            } catch (e: Exception) {
+                "用户保存失败：${e.readable()}"
+            }
+            working = false
+        }
+    }
+
+    fun confirmDeleteUser(account: AccountProfile) {
+        val target = pendingUserDelete ?: return
+        val id = Resp.l(target, "id")
+        if (id <= 0L) {
+            pendingUserDelete = null
+            message = "该用户缺少 id，无法删除"
+            return
+        }
+        viewModelScope.launch {
+            working = true
+            message = try {
+                ApiClient.apiFor(account).deleteUser(id)
+                loadUsers(account)
+                "用户已删除"
+            } catch (e: Exception) {
+                e.readable()
+            }
+            pendingUserDelete = null
+            working = false
+        }
+    }
+
     fun uploadCert(account: AccountProfile, comment: String, crt: String, key: String) {
         viewModelScope.launch {
             working = true
@@ -354,9 +471,14 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel, updateVm: UpdateV
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = { msgHost.Host() },
         floatingActionButton = {
-            if (vm.currentKey() == "cert") {
-                FloatingActionButton(onClick = { vm.openCertEditor() }) {
+            // FAB 按页签切换动作：证书页导入证书，用户页新增用户。
+            // 不用固定文案，按钮图标都是 +，靠 contentDescription 区分无障碍语义。
+            when (vm.currentKey()) {
+                "cert" -> FloatingActionButton(onClick = { vm.openCertEditor() }) {
                     Icon(Icons.Default.Add, contentDescription = "导入证书")
+                }
+                "users" -> FloatingActionButton(onClick = { vm.openUserCreate() }) {
+                    Icon(Icons.Default.Add, contentDescription = "新增用户")
                 }
             }
         }
@@ -377,7 +499,13 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel, updateVm: UpdateV
                     { vm.loadCerts(account) },
                     onDelete = { o -> vm.requestDeleteCert(o) }
                 )
-                "users" -> ListArea(vm.users, "未获取到用户（需管理员权限）", { vm.loadUsers(account) })
+                "users" -> ListArea(
+                    vm.users,
+                    "未获取到用户（需管理员权限）",
+                    { vm.loadUsers(account) },
+                    onEdit = { o -> vm.openUserEdit(o) },
+                    onDelete = { o -> vm.requestDeleteUser(o) }
+                )
                 "token" -> ListArea(
                     vm.tokens, "暂无 API Token 信息",
                     { vm.loadTokens(account) },
@@ -440,6 +568,106 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel, updateVm: UpdateV
             onSave = { c, crt, key -> vm.uploadCert(account, c, crt, key) }
         )
     }
+
+    // 删除用户：可能删掉正在使用的管理员账号，必须二次确认并提示影响
+    vm.pendingUserDelete?.let { o ->
+        val name = Resp.str(o, "username", "name", "user").ifBlank { Resp.l(o, "id").toString() }
+        AlertDialog(
+            onDismissRequest = { vm.cancelDeleteUser() },
+            title = { Text("删除用户") },
+            text = {
+                Text("确定删除用户「$name」？\n该用户将立即失去登录与 API 调用权限，且不可撤销。")
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.confirmDeleteUser(account) }, enabled = !vm.working) {
+                    Text("删除", color = Danger)
+                }
+            },
+            dismissButton = { TextButton(onClick = { vm.cancelDeleteUser() }) { Text("取消") } }
+        )
+    }
+
+    // 新增 / 编辑用户
+    vm.userEditor?.let { edit ->
+        UserDialog(
+            working = vm.working,
+            isCreate = edit.id <= 0L,
+            init = edit,
+            onDismiss = { vm.closeUserEditor() },
+            onSave = { vm.saveUser(account, it) }
+        )
+    }
+}
+
+/** 用户新增/编辑弹窗。字段用 rememberSaveable，旋转屏幕不丢已输入内容。 */
+@Composable
+private fun UserDialog(
+    working: Boolean,
+    isCreate: Boolean,
+    init: UserEdit,
+    onDismiss: () -> Unit,
+    onSave: (UserEdit) -> Unit
+) {
+    var username by rememberSaveable(init.id) { mutableStateOf(init.username) }
+    var password by rememberSaveable(init.id) { mutableStateOf("") }
+    var role by rememberSaveable(init.id) { mutableStateOf(init.role) }
+    var showPwd by rememberSaveable(init.id) { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (isCreate) "新增用户" else "编辑用户") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("用户名") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = {
+                        Text(if (isCreate) "密码" else "密码（留空则不修改）")
+                    },
+                    singleLine = true,
+                    visualTransformation = if (showPwd) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        IconButton(onClick = { showPwd = !showPwd }) {
+                            Icon(
+                                if (showPwd) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (showPwd) "隐藏密码" else "显示密码"
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = role,
+                    onValueChange = { role = it },
+                    label = { Text("角色（可选，如 admin / normal）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onSave(UserEdit(init.id, username, password, role))
+                },
+                enabled = !working
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @Composable
@@ -447,7 +675,8 @@ private fun ListArea(
     state: UiState<List<JsonObject>>,
     emptyText: String,
     onRetry: () -> Unit,
-    onDelete: ((JsonObject) -> Unit)? = null
+    onDelete: ((JsonObject) -> Unit)? = null,
+    onEdit: ((JsonObject) -> Unit)? = null
 ) {
     when (state) {
         UiState.Idle, UiState.Loading -> Box(
@@ -489,6 +718,16 @@ private fun ListArea(
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                            }
+                            if (onEdit != null) {
+                                IconButton(onClick = { onEdit(o) }) {
+                                    Icon(
+                                        Icons.Default.Edit,
+                                        contentDescription = "编辑",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                             if (onDelete != null) {
                                 IconButton(onClick = { onDelete(o) }) {

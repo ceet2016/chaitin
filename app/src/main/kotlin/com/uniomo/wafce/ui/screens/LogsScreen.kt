@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -17,20 +18,24 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -38,6 +43,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -50,12 +57,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.uniomo.wafce.core.Resp
+import com.uniomo.wafce.core.UiState
 import com.uniomo.wafce.core.readable
 import com.uniomo.wafce.data.net.ApiClient
 import com.uniomo.wafce.data.store.AccountProfile
 import com.uniomo.wafce.ui.components.AsyncBox
 import com.uniomo.wafce.ui.components.CardShape
 import com.uniomo.wafce.ui.components.EmptyBox
+import com.uniomo.wafce.ui.components.KeyValueRow
 import com.uniomo.wafce.ui.components.SectionCard
 import com.uniomo.wafce.ui.components.TagChip
 import com.uniomo.wafce.ui.theme.Brand
@@ -67,7 +76,25 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private val LOG_TABS = listOf("攻击事件", "拦截记录", "人机验证", "身份认证")
+/**
+ * 日志分类。
+ *
+ * 「拦截记录」在雷池控制台里的官方叫法是「频率控制」——它记录的是
+ * 访问控制/频率限制命中后的拦截，因此这里跟随控制台命名，避免用户困惑。
+ */
+enum class LogKind(val label: String, val color: androidx.compose.ui.graphics.Color) {
+    EVENT("攻击事件", Danger),
+    ACL("频率控制", Warn),
+    CHALLENGE("人机验证", InfoColor),
+    AUTH("身份认证", Ok),
+    ACCESS("访问日志", Brand);
+
+    companion object {
+        fun of(index: Int): LogKind = entries.getOrElse(index) { EVENT }
+    }
+}
+
+private val LOG_TABS = LogKind.entries.map { it.label }
 
 data class LogEntry(
     val id: String,
@@ -76,8 +103,6 @@ data class LogEntry(
     val attrLine: String,
     val raw: JsonObject
 )
-
-enum class LogKind { EVENT, ACL, CHALLENGE, AUTH }
 
 class LogsVm : ViewModel() {
 
@@ -91,11 +116,22 @@ class LogsVm : ViewModel() {
     var entries by mutableStateOf(listOf<LogEntry>())
         private set
 
+    /** 详情弹窗内容：raw 为空表示正在加载 */
     private val _detail = MutableStateFlow<JsonObject?>(null)
     val detail: StateFlow<JsonObject?> = _detail
 
+    /** 正在拉取详情（攻击事件会额外请求 /events/{id} 拿到完整字段） */
+    var detailLoading by mutableStateOf(false)
+        private set
+
+    /** 详情是否来自服务端二次请求，用于在弹窗里标注 */
+    var detailFromServer by mutableStateOf(false)
+        private set
+
     /** 分页结果缓存：切回已看过的页时立即出内容，避免每次都转圈 */
     private val cache = java.util.concurrent.ConcurrentHashMap<Pair<Int, Int>, List<LogEntry>>()
+
+    fun kind(): LogKind = LogKind.of(tab)
 
     fun load(account: AccountProfile) {
         val key = tab to page
@@ -110,11 +146,13 @@ class LogsVm : ViewModel() {
             try {
                 val api = ApiClient.apiFor(account)
                 val q = mapOf("page" to page.toString(), "page_size" to "20")
-                val body = when (kind()) {
+                val k = kind()
+                val body = when (k) {
                     LogKind.EVENT -> api.events(q)
                     LogKind.ACL -> api.recordsAcl(q)
                     LogKind.CHALLENGE -> api.recordsChallenge(q)
                     LogKind.AUTH -> api.recordsAuthDefense(q)
+                    LogKind.ACCESS -> api.recordsAccess(q)
                 }
                 val raw = Resp.obj(body)
                 entries = Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map { buildEntry(it) }
@@ -137,14 +175,35 @@ class LogsVm : ViewModel() {
     fun next(account: AccountProfile) { page += 1; load(account) }
     fun prev(account: AccountProfile) { if (page > 1) page -= 1; load(account) }
 
-    fun openDetail(o: JsonObject) { _detail.value = o }
     fun closeDetail() { _detail.value = null }
 
-    private fun kind(): LogKind = when (tab) {
-        0 -> LogKind.EVENT
-        1 -> LogKind.ACL
-        2 -> LogKind.CHALLENGE
-        else -> LogKind.AUTH
+    /**
+     * 打开详情。
+     *
+     * 攻击事件（/open/events）列表返回的是精简字段，真正的详情要再打
+     * /open/events/{id} 才能拿到攻击类型、命中规则、请求报文等；
+     * 其余日志列表本身就是完整记录，直接展示即可。
+     */
+    fun openDetail(account: AccountProfile, entry: LogEntry) {
+        _detail.value = entry.raw
+        detailFromServer = false
+        if (kind() != LogKind.EVENT || entry.id.isBlank() || entry.id == "0") return
+
+        detailLoading = true
+        viewModelScope.launch {
+            val fetched = runCatching {
+                Resp.obj(ApiClient.apiFor(account).eventDetail(entry.id))
+            }.getOrNull()
+            detailLoading = false
+            if (fetched != null && fetched.size() > 0) {
+                // 服务端详情为准，但保留列表里独有的字段（如列表侧的 host 展示名）
+                val merged = JsonObject()
+                entry.raw.entrySet().forEach { (k, v) -> merged.add(k, v) }
+                fetched.entrySet().forEach { (k, v) -> merged.add(k, v) }
+                _detail.value = merged
+                detailFromServer = true
+            }
+        }
     }
 
     private fun buildEntry(o: JsonObject): LogEntry {
@@ -182,7 +241,7 @@ class LogsVm : ViewModel() {
 }
 
 @Composable
-fun LogsScreen(account: AccountProfile) {
+fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
     val vm: LogsVm = viewModel()
     // 关键：必须 collectAsState，直接读 StateFlow.value 不会触发重组，
     // 会导致弹窗「点不开 / 关不掉」
@@ -191,6 +250,14 @@ fun LogsScreen(account: AccountProfile) {
     DisposableEffect(account.id) {
         vm.load(account)
         onDispose { }
+    }
+
+    // 从首页指标卡跳转过来时，直接落到对应分类
+    LaunchedEffect(initialTab) {
+        if (initialTab >= 0 && initialTab != vm.tab) {
+            vm.tab = initialTab
+            vm.setTab(account, initialTab)
+        }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -228,7 +295,7 @@ fun LogsScreen(account: AccountProfile) {
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
                 items(vm.entries) { e ->
-                    LogRowView(entry = e, onClick = { vm.openDetail(e.raw) })
+                    LogRowView(entry = e, onClick = { vm.openDetail(account, e) })
                 }
                 item { Spacer(Modifier.height(80.dp)) }
             }
@@ -236,19 +303,12 @@ fun LogsScreen(account: AccountProfile) {
     }
 
     detail?.let { raw ->
-        AlertDialog(
-            onDismissRequest = { vm.closeDetail() },
-            title = { Text("记录详情") },
-            text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text(
-                        GsonBuilder().setPrettyPrinting().create().toJson(raw),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            },
-            confirmButton = { TextButton(onClick = { vm.closeDetail() }) { Text("关闭") } }
+        LogDetailDialog(
+            kind = vm.kind(),
+            raw = raw,
+            loading = vm.detailLoading,
+            enhanced = vm.detailFromServer,
+            onDismiss = { vm.closeDetail() }
         )
     }
 }
@@ -295,3 +355,256 @@ private fun LogRowView(entry: LogEntry, onClick: () -> Unit) {
         }
     }
 }
+
+/**
+ * 攻击/拦截日志详情。
+ *
+ * 分两层展示：
+ * 1. 「关键信息」——把常见字段翻译成中文并按语义分组，用户不用读 JSON 也能看懂
+ * 2. 「原始记录」——完整 JSON，保留排查现场的能力
+ */
+@Composable
+private fun LogDetailDialog(
+    kind: LogKind,
+    raw: JsonObject,
+    loading: Boolean,
+    enhanced: Boolean,
+    onDismiss: () -> Unit
+) {
+    val clipboard = LocalClipboardManager.current
+    var showRaw by remember { mutableStateOf(false) }
+    val groups = remember(raw) { groupize(raw) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("${kind.label}详情")
+                if (loading) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "正在拉取完整详情…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else if (enhanced) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "已加载服务端完整记录",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Ok
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // 概要
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = CardShape,
+                    colors = CardDefaults.cardColors(containerColor = kind.color.copy(alpha = 0.10f))
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                        KeyValueRow("来源 IP", Resp.str(raw, "src_ip", "ip", "client_ip", "remote_addr").ifBlank { "—" })
+                        KeyValueRow("目标 Host", Resp.str(raw, "host", "server_name", "domain", "dst_host").ifBlank { "—" })
+                        KeyValueRow("请求方法", Resp.str(raw, "method", "http_method").ifBlank { "—" })
+                        KeyValueRow("请求 URL", Resp.str(raw, "url", "uri", "path", "request_path").ifBlank { "—" })
+                        KeyValueRow("状态码", Resp.l(raw, "status_code", "status", "code").takeIf { it > 0 }?.toString() ?: "—")
+                        KeyValueRow("归属地区", Resp.str(raw, "province", "region", "country", "location").ifBlank { "—" })
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // 攻击/拦截特征
+                val feature = groups.firstOrNull { it.first == "attack" }
+                if (feature != null && feature.second.isNotEmpty()) {
+                    GroupCard("攻击特征")
+                    feature.second.forEach { (k, v) -> KeyValueRow(FEATURE_LABELS[k] ?: k, v) }
+                    Spacer(Modifier.height(12.dp))
+                }
+
+                val req = groups.firstOrNull { it.first == "request" }
+                if (req != null && req.second.isNotEmpty()) {
+                    GroupCard("请求内容")
+                    req.second.forEach { (k, v) -> KeyValueRow(REQUEST_LABELS[k] ?: k, v, InfoColor) }
+                    Spacer(Modifier.height(12.dp))
+                }
+
+                val other = groups.firstOrNull { it.first == "other" }
+                if (other != null && other.second.isNotEmpty()) {
+                    GroupCard("其他字段")
+                    other.second.forEach { (k, v) -> KeyValueRow(OTHER_LABELS[k] ?: k, v) }
+                    Spacer(Modifier.height(12.dp))
+                }
+
+                // 原始 JSON
+                Surface(
+                    onClick = { showRaw = !showRaw },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = CardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            if (showRaw) "收起原始记录" else "查看原始记录（JSON）",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = {
+                                clipboard.setText(
+                                    AnnotatedString(GsonBuilder().setPrettyPrinting().create().toJson(raw))
+                                )
+                            },
+                            modifier = Modifier.size(30.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = "复制 JSON",
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+                if (showRaw) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        GsonBuilder().setPrettyPrinting().create().toJson(raw),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+    )
+}
+
+@Composable
+private fun GroupCard(title: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            title,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f)
+        )
+    }
+    Spacer(Modifier.height(4.dp))
+}
+
+/**
+ * 把原始 JSON 按语义分成三组，避免所有字段平铺导致关键信息被淹没。
+ * 返回 Pair<分组名, 字段列表>，分组名取值：attack / request / other。
+ */
+private fun groupize(raw: JsonObject): List<Pair<String, List<Pair<String, String>>>> {
+    val attack = mutableListOf<Pair<String, String>>()
+    val request = mutableListOf<Pair<String, String>>()
+    val other = mutableListOf<Pair<String, String>>()
+
+    for ((k, v) in raw.entrySet()) {
+        if (v.isJsonNull) continue
+        val key = k.lowercase()
+        val text = when {
+            v.isJsonPrimitive && v.asJsonPrimitive.isNumber -> v.asString
+            v.isJsonPrimitive && v.asJsonPrimitive.isBoolean -> if (v.asBoolean) "是" else "否"
+            v.isJsonPrimitive -> v.asString
+            v.isJsonArray -> v.asJsonArray.size().let { "$it 项" }
+            else -> continue
+        }
+        if (text.isBlank()) continue
+
+        when {
+            key in ATTACK_KEYS -> attack.add(k to text)
+            key in REQUEST_KEYS -> request.add(k to text)
+            key in SKIP_KEYS -> Unit
+            else -> other.add(k to text)
+        }
+    }
+    return listOf("attack" to attack, "request" to request, "other" to other)
+}
+
+private val ATTACK_KEYS = setOf(
+    "attack_type", "attack", "rule_id", "rule_name", "task_name", "category",
+    "engine", "event_type", "type", "level", "severity", "confidence",
+    "payload", "evidence", "detail", "reason", "cve", "cve_id", "log_id"
+)
+
+private val REQUEST_KEYS = setOf(
+    "user_agent", "useragent", "referer", "referrer", "cookie", "request_body",
+    "req_body", "body", "query", "headers", "req_header", "attack_detail",
+    "req_id", "trace_id", "x_forwarded_for"
+)
+
+private val SKIP_KEYS = setOf(
+    "src_ip", "ip", "client_ip", "remote_addr", "source_ip",
+    "host", "server_name", "domain", "dst_host", "server",
+    "method", "http_method", "url", "uri", "path", "request_path",
+    "status_code", "status", "code",
+    "province", "region", "country", "location",
+    "id", "uid", "uuid", "timestamp", "time", "time_stamp",
+    "create_time", "created_at", "ts"
+)
+
+private val FEATURE_LABELS = mapOf(
+    "attack_type" to "攻击类型",
+    "attack" to "攻击描述",
+    "rule_id" to "命中规则 ID",
+    "rule_name" to "命中规则",
+    "task_name" to "任务名称",
+    "category" to "分类",
+    "engine" to "检测引擎",
+    "event_type" to "事件类型",
+    "type" to "类型",
+    "level" to "危险等级",
+    "severity" to "严重程度",
+    "confidence" to "置信度",
+    "payload" to "攻击载荷",
+    "evidence" to "判定依据",
+    "detail" to "详情",
+    "reason" to "命中原因",
+    "cve" to "CVE 编号",
+    "cve_id" to "CVE 编号",
+    "log_id" to "日志 ID"
+)
+
+private val REQUEST_LABELS = mapOf(
+    "user_agent" to "User-Agent",
+    "useragent" to "User-Agent",
+    "referer" to "Referer",
+    "referrer" to "Referer",
+    "cookie" to "Cookie",
+    "request_body" to "请求体",
+    "req_body" to "请求体",
+    "body" to "请求体",
+    "query" to "查询串",
+    "headers" to "请求头",
+    "req_header" to "请求头",
+    "attack_detail" to "报文详情",
+    "req_id" to "请求 ID",
+    "trace_id" to "Trace ID",
+    "x_forwarded_for" to "X-Forwarded-For"
+)
+
+private val OTHER_LABELS = mapOf(
+    "action" to "处置动作",
+    "site_id" to "站点 ID",
+    "site_name" to "站点名称",
+    "node_id" to "节点 ID",
+    "is_waf" to "是否 WAF 响应",
+    "duration" to "耗时",
+    "time_stamp" to "时间"
+)

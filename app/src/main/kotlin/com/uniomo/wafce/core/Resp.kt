@@ -202,6 +202,86 @@ object Resp {
 
     private val IGNORE_LABEL_KEYS = setOf("id", "uuid", "hash", "key")
 
+    // ------------------------------------------------------------------
+    // 时序数据解析（趋势图数据源）
+    //
+    // 雷池各版本的统计接口（stat/qps、dashboard/requests、dashboard/intercepts…）
+    // 返回结构差异很大：有的是裸数组，有的是 { nodes: [...] }，
+    // 数组元素还可能是纯数字而非对象。这里用「就地和 + 忽略时间字段」的方式兼容。
+    // ------------------------------------------------------------------
+
+    /** 时序点：数值 + 时间标签（标签可能为空） */
+    data class SeriesPoint(val value: Float, val label: String)
+
+    private val SERIES_LABEL_KEYS = arrayOf(
+        "time", "time_stamp", "timestamp", "ts", "date", "datetime",
+        "hour", "t", "label", "name", "day"
+    )
+
+    private val SERIES_LABEL_SET = SERIES_LABEL_KEYS.toSet()
+
+    /** 取 data 层，失败返回 null（统计接口经常整块缺失，不应抛异常） */
+    fun dataOrNull(body: JsonObject?): JsonElement? = runCatching { unwrap(body) }.getOrNull()
+
+    /**
+     * 宽松解析时序数组。元素为对象时，把所有「非时间字段的数值」求和作为该点数值；
+     * 元素为裸数字时直接作为数值点。
+     */
+    fun seriesOf(body: JsonObject?): List<SeriesPoint> {
+        val arr = firstArray(dataOrNull(body)) ?: return emptyList()
+        val out = mutableListOf<SeriesPoint>()
+        for (el in arr) {
+            if (el.isJsonPrimitive && (el as JsonPrimitive).isNumber) {
+                out.add(SeriesPoint(el.asFloat, ""))
+                continue
+            }
+            if (!el.isJsonObject) continue
+            val o = el.asJsonObject
+            var value = 0f
+            for ((k, v) in o.entrySet()) {
+                if (k.lowercase() in SERIES_LABEL_SET) continue
+                if (v.isJsonPrimitive && (v as JsonPrimitive).isNumber) value += v.asFloat
+            }
+            out.add(SeriesPoint(value, labelOf(o)))
+        }
+        return out
+    }
+
+    /** 从时序元素里取时间标签，能转成时间戳就格式化成 HH:mm */
+    private fun labelOf(o: JsonObject): String {
+        for (k in SERIES_LABEL_KEYS) {
+            val el = o.get(k) ?: continue
+            if (el.isJsonNull || !el.isJsonPrimitive) continue
+            val p = el.asJsonPrimitive
+            if (p.isNumber) return clockLabel(p.asLong)
+            if (p.isString && p.asString.isNotBlank()) return p.asString.take(16)
+        }
+        return ""
+    }
+
+    private fun clockLabel(raw: Long): String = try {
+        val ms = if (raw > 10_000_000_000L) raw else raw * 1000L
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(ms))
+    } catch (e: Exception) {
+        ""
+    }
+
+    /**
+     * 统计对象里的「总数」：优先 total/count，其次统计所有数字字段求和。
+     * security_posture 这类接口没有 total，需要按字段汇总。
+     */
+    fun sumNumbers(o: JsonObject?, vararg skip: String): Long {
+        val obj = o ?: return 0L
+        val skipSet = skip.toSet()
+        var sum = 0L
+        for ((k, v) in obj.entrySet()) {
+            if (k.lowercase() in skipSet) continue
+            if (v.isJsonPrimitive && (v as JsonPrimitive).isNumber) sum += v.asLong
+        }
+        return sum
+    }
+
     private fun pick(parent: JsonObject?, vararg keys: String): JsonElement? {
         if (parent == null) return null
         for (k in keys) {

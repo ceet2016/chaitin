@@ -52,6 +52,20 @@ interface SafeLineApi {
     suspend fun statQps(@QueryMap q: Map<String, String>): JsonObject
 
     /**
+     * 访问量 / 拦截量趋势。
+     *
+     * 这两个接口属于控制台内部接口，路径与可用性随版本变化：
+     * 社区版实测 /api/stat/requests 与 /api/stat/intercepts 可用，
+     * 老版本则是 /api/dashboard/requests、/api/dashboard/intercepts。
+     * 客户端通过 [rawGet] 依次尝试，命中任一即可，不做硬编码假设。
+     */
+    @GET("api/stat/requests")
+    suspend fun statRequests(@QueryMap q: Map<String, String>): JsonObject
+
+    @GET("api/stat/intercepts")
+    suspend fun statIntercepts(@QueryMap q: Map<String, String>): JsonObject
+
+    /**
      * 安全态势统计 —— 社区版可用。
      * 旧版 dashboard 系列接口在 9.x 已移除；stat/advance 系列为商业版能力，
      * 社区版请求会返回 403 license required，因此仪表盘以本接口为准。

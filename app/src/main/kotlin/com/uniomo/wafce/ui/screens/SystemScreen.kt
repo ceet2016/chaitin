@@ -68,6 +68,7 @@ import com.uniomo.wafce.ui.theme.Brand
 import com.uniomo.wafce.ui.theme.Danger
 import com.uniomo.wafce.ui.theme.Warn
 import com.uniomo.wafce.vm.AppViewModel
+import com.uniomo.wafce.vm.UpdateVm
 
 data class SysTab(val key: String, val label: String)
 
@@ -261,7 +262,7 @@ class SystemVm : ViewModel() {
 }
 
 @Composable
-fun SystemScreen(account: AccountProfile, appVm: AppViewModel) {
+fun SystemScreen(account: AccountProfile, appVm: AppViewModel, updateVm: UpdateVm? = null) {
     val vm: SystemVm = viewModel()
     DisposableEffect(account.id) {
         vm.loadAll(account)
@@ -320,7 +321,7 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel) {
                     onDelete = { vm.deleteToken(account) }
                 )
                 "notice" -> ListArea(vm.notices, "暂无通知策略", { vm.loadNotices(account) })
-                "system" -> AboutScreen(account = account, appVm = appVm)
+                "system" -> AboutScreen(account = account, appVm = appVm, updateVm = updateVm)
             }
         }
     }

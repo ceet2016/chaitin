@@ -10,6 +10,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import com.uniomo.wafce.core.HttpStatusException
 import com.uniomo.wafce.core.LicenseRequiredException
+import com.uniomo.wafce.core.Resp
 import com.uniomo.wafce.core.UnauthorizedException
 import com.uniomo.wafce.data.store.AccountProfile
 import com.uniomo.wafce.data.store.AccountStore
@@ -153,5 +154,27 @@ object ApiClient {
 
     fun invalidate(accountId: Long) {
         apiCache.remove(accountId)
+    }
+
+    /**
+     * 探测一个控制台内部接口是否可用且能解析出时序数据。
+     *
+     * 存在的原因：访问/拦截趋势的路径随雷池版本变化（stat/requests 与
+     * dashboard/requests 二选一），写死在 Retrofit 里会在另一个版本上直接 404。
+     * 这里用 [SafeLineApi.rawGet] 逐个尝试，命中第一个能用的即可。
+     *
+     * @return 解析出的时序点；全部候选路径都不可用时返回空列表
+     */
+    suspend fun probeSeries(
+        accountId: Long,
+        candidates: List<String>
+    ): List<Resp.SeriesPoint> {
+        val api = apiCache[accountId]?.second ?: return emptyList()
+        for (path in candidates) {
+            val body = runCatching { api.rawGet(path) }.getOrNull() ?: continue
+            val pts = Resp.seriesOf(body)
+            if (pts.size >= 2) return pts
+        }
+        return emptyList()
     }
 }

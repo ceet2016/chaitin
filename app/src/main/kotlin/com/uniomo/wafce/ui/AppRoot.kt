@@ -42,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -51,6 +52,7 @@ import androidx.navigation.navArgument
 import com.uniomo.wafce.data.store.AccountProfile
 import com.uniomo.wafce.ui.screens.AboutScreen
 import com.uniomo.wafce.ui.screens.AccountsScreen
+import com.uniomo.wafce.ui.screens.DashTarget
 import com.uniomo.wafce.ui.screens.DashboardScreen
 import com.uniomo.wafce.ui.screens.LoginScreen
 import com.uniomo.wafce.ui.screens.LogsScreen
@@ -72,17 +74,44 @@ object Route {
     const val System = "system"
     const val About = "about"
     const val SiteDetail = "site/{id}"
+
+    /** 携带跳转上下文的路由变体，参数在 composable 上解析 */
+    const val LogsAt = "logs?tab={tab}"
+    const val ProtectAt = "protect?tab={tab}"
+
+    fun logsAt(tab: Int) = "logs?tab=$tab"
+    fun protectAt(tab: String) = "protect?tab=$tab"
+
+    const val ARG_TAB = "tab"
 }
 
-private data class NavItem(val route: String, val label: String, val icon: ImageVector)
+private data class NavItem(
+    val route: String,
+    val label: String,
+    val icon: ImageVector,
+    /** 带参数的等价路由，用于高亮匹配（logs?tab=1 也应点亮「日志」） */
+    val aliases: List<String> = emptyList()
+)
 
 private val navItems = listOf(
     NavItem(Route.Dashboard, "概览", Icons.Default.Dashboard),
     NavItem(Route.Sites, "站点", Icons.Default.Dns),
-    NavItem(Route.Protect, "防护", Icons.Default.Security),
-    NavItem(Route.Logs, "日志", Icons.Default.Article),
+    NavItem(Route.Protect, "防护", Icons.Default.Security, listOf(Route.ProtectAt)),
+    NavItem(Route.Logs, "日志", Icons.Default.Article, listOf(Route.LogsAt)),
     NavItem(Route.System, "系统", Icons.Default.Settings)
 )
+
+/**
+ * 切换主页面。带参数的路由（如 logs?tab=1）也要先 pop 回顶层再切，
+ * 否则底栏会不断堆叠同名页面，返回键需要按很多次。
+ */
+private fun NavHostController.navigateToTab(route: String) {
+    navigate(route) {
+        popUpTo(graph.startDestinationId) { saveState = true }
+        launchSingleTop = true
+        restoreState = true
+    }
+}
 
 @Composable
 fun AppRoot(vm: AppViewModel) {
@@ -132,29 +161,19 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
                     IconButton(onClick = { sheetOpen = true }) {
                         Icon(Icons.Default.SwapHoriz, contentDescription = "切换账号")
                     }
-                },
-                actions = {
-                    IconButton(onClick = { updateVm.check() }) {
-                        Icon(Icons.Default.SystemUpdate, contentDescription = "检查更新")
-                    }
-                    IconButton(onClick = { vm.reload(); vm.ensureCurrentSession() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "刷新")
-                    }
                 }
+                // 顶栏右侧刻意留空：更新与刷新入口已下沉到各页面自身
+                // （检查更新 → 系统 → 关于，手动刷新 → 各页顶部）
             )
         },
         bottomBar = {
             NavigationBar {
                 navItems.forEach { item ->
+                    val selected = currentRoute == item.route ||
+                        item.aliases.any { it.substringBefore("?") == currentRoute }
                     NavigationBarItem(
-                        selected = currentRoute == item.route,
-                        onClick = {
-                            nav.navigate(item.route) {
-                                popUpTo(Route.Dashboard) { saveState = true }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        },
+                        selected = selected,
+                        onClick = { nav.navigateToTab(item.route) },
                         icon = { Icon(item.icon, contentDescription = item.label, modifier = Modifier.size(22.dp)) },
                         label = { Text(item.label, style = MaterialTheme.typography.labelSmall) }
                     )
@@ -167,13 +186,44 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
             startDestination = Route.Dashboard,
             modifier = Modifier.padding(padding)
         ) {
-            composable(Route.Dashboard) { DashboardScreen(account) }
+            composable(Route.Dashboard) {
+                DashboardScreen(account) { target ->
+                    when (target) {
+                        is DashTarget.Page -> nav.navigateToTab(target.route)
+                        is DashTarget.LogTab -> nav.navigateToTab(Route.logsAt(target.index))
+                        is DashTarget.ProtectTab -> nav.navigateToTab(Route.protectAt(target.key))
+                    }
+                }
+            }
             composable(Route.Sites) { SitesScreen(account, nav) }
             composable(Route.Protect) { ProtectScreen(account) }
             composable(Route.Logs) { LogsScreen(account) }
-            composable(Route.System) { SystemScreen(account, vm) }
+            composable(Route.System) { SystemScreen(account, vm, updateVm) }
             composable(Route.About) {
-                AboutScreen(account = account, appVm = vm) { nav.popBackStack() }
+                AboutScreen(
+                    account = account,
+                    appVm = vm,
+                    onBack = { nav.popBackStack() },
+                    updateVm = updateVm
+                )
+            }
+            composable(
+                route = Route.LogsAt,
+                arguments = listOf(navArgument(Route.ARG_TAB) {
+                    type = NavType.IntType
+                    defaultValue = 0
+                })
+            ) { entry ->
+                LogsScreen(account, entry.arguments?.getInt(Route.ARG_TAB) ?: 0)
+            }
+            composable(
+                route = Route.ProtectAt,
+                arguments = listOf(navArgument(Route.ARG_TAB) {
+                    type = NavType.StringType
+                    defaultValue = ""
+                })
+            ) { entry ->
+                ProtectScreen(account, entry.arguments?.getString(Route.ARG_TAB)?.ifBlank { null })
             }
             composable(
                 route = Route.SiteDetail,

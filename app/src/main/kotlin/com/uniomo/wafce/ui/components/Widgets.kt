@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -166,6 +167,8 @@ fun SectionCard(
 /**
  * 指标卡片：带主题色渐变底 + 圆形图标，比纯白卡片更有层次。
  * 参数顺序注意：第 4 个是 modifier，调用处请用命名参数避免错位。
+ *
+ * @param onClick 非空时右上角显示箭头，提示可点击进入下级页面。
  */
 @Composable
 fun StatCard(
@@ -216,8 +219,17 @@ fun StatCard(
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
+                    if (onClick != null) {
+                        Icon(
+                            Icons.Default.ChevronRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(
@@ -334,13 +346,19 @@ fun KeyValueRow(key: String, value: String, color: Color = Color.Unspecified) {
     }
 }
 
-/** 轻量折线趋势图（Canvas 自绘，避免引入第三方图表库） */
+/**
+ * 轻量折线趋势图（Canvas 自绘，避免引入第三方图表库）。
+ *
+ * @param labels 时间轴标签，通常传首尾两个（如 24 小时前的时刻、当前时刻）；
+ *               传空列表则不渲染坐标轴文字。
+ */
 @Composable
 fun TrendChart(
     points: List<Float>,
     modifier: Modifier = Modifier,
     color: Color = Brand,
-    height: Dp = 120.dp
+    height: Dp = 120.dp,
+    labels: List<String> = emptyList()
 ) {
     if (points.isEmpty()) {
         EmptyBox("暂无趋势数据")
@@ -348,46 +366,74 @@ fun TrendChart(
     }
     val safe = if (points.size == 1) listOf(points.first(), points.first()) else points
     val max = safe.maxOrNull()?.coerceAtLeast(1f) ?: 1f
-    Canvas(modifier = modifier.fillMaxWidth().height(height)) {
-        val stepX = size.width / (safe.size - 1).coerceAtLeast(1)
-        fun yOf(v: Float) = size.height - (v / max) * size.height * 0.88f - size.height * 0.06f
+    Column(modifier.fillMaxWidth()) {
+        Text(
+            "峰值 ${fmtNum(max)}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.End)
+        )
+        Spacer(Modifier.height(2.dp))
+        Canvas(Modifier.fillMaxWidth().height(height)) {
+            val stepX = size.width / (safe.size - 1).coerceAtLeast(1)
+            fun yOf(v: Float) = size.height - (v / max) * size.height * 0.88f - size.height * 0.06f
 
-        val line = Path()
-        val fill = Path()
-        safe.forEachIndexed { i, v ->
-            val x = i * stepX
-            val y = yOf(v)
-            if (i == 0) {
-                line.moveTo(x, y)
-                fill.moveTo(x, size.height)
-            } else {
-                line.lineTo(x, y)
+            val line = Path()
+            val fill = Path()
+            safe.forEachIndexed { i, v ->
+                val x = i * stepX
+                val y = yOf(v)
+                if (i == 0) {
+                    line.moveTo(x, y)
+                    fill.moveTo(x, size.height)
+                } else {
+                    line.lineTo(x, y)
+                }
+                fill.lineTo(x, y)
             }
-            fill.lineTo(x, y)
-        }
-        fill.lineTo(size.width, size.height)
-        fill.close()
+            fill.lineTo(size.width, size.height)
+            fill.close()
 
-        drawPath(
-            path = fill,
-            brush = Brush.verticalGradient(
-                listOf(color.copy(alpha = 0.26f), Color.Transparent)
+            drawPath(
+                path = fill,
+                brush = Brush.verticalGradient(
+                    listOf(color.copy(alpha = 0.26f), Color.Transparent)
+                )
             )
-        )
-        drawPath(
-            path = line,
-            color = color,
-            style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
-        )
-        safe.forEachIndexed { i, v ->
-            drawCircle(
+            drawPath(
+                path = line,
                 color = color,
-                radius = 3.2.dp.toPx(),
-                center = Offset(i * stepX, yOf(v))
+                style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
             )
+            safe.forEachIndexed { i, v ->
+                drawCircle(
+                    color = color,
+                    radius = 3.2.dp.toPx(),
+                    center = Offset(i * stepX, yOf(v))
+                )
+            }
+        }
+        if (labels.size >= 2) {
+            Spacer(Modifier.height(4.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    labels.first(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    labels.last(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }
+
+private fun fmtNum(v: Float): String =
+    if (v >= 1000f) String.format("%,d", v.toLong()) else
+        if (v % 1f == 0f) v.toLong().toString() else String.format("%.1f", v)
 
 /** Top N 排行条 */
 @Composable

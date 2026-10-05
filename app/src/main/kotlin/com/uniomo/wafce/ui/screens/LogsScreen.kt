@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -57,6 +58,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.uniomo.wafce.core.Resp
+import com.uniomo.wafce.core.TimeFmt
 import com.uniomo.wafce.core.UiState
 import com.uniomo.wafce.core.readable
 import com.uniomo.wafce.data.net.ApiClient
@@ -67,27 +69,27 @@ import com.uniomo.wafce.ui.components.EmptyBox
 import com.uniomo.wafce.ui.components.KeyValueRow
 import com.uniomo.wafce.ui.components.SectionCard
 import com.uniomo.wafce.ui.components.TagChip
-import com.uniomo.wafce.ui.theme.Brand
 import com.uniomo.wafce.ui.theme.Danger
 import com.uniomo.wafce.ui.theme.InfoColor
 import com.uniomo.wafce.ui.theme.Ok
 import com.uniomo.wafce.ui.theme.Warn
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 日志分类。
  *
  * 「拦截记录」在雷池控制台里的官方叫法是「频率控制」——它记录的是
  * 访问控制/频率限制命中后的拦截，因此这里跟随控制台命名，避免用户困惑。
+ *
+ * 关于「访问日志」：官方 OpenAPI（chaitin/workspace-cli 的 safeline-ce/openapi.json）
+ * 里日志类只暴露 `/open/records`（攻击日志）与 `/open/records/rule`（黑白名单命中日志），
+ * **没有访问日志列表接口**。控制台的「流量分析」页之所以能展示访问曲线，
+ * 是因为它走的是统计聚合接口而非日志列表。因此原先的第五个页签恒为 404，已移除。
  */
 enum class LogKind(val label: String, val color: androidx.compose.ui.graphics.Color) {
     EVENT("攻击事件", Danger),
     ACL("频率控制", Warn),
     CHALLENGE("人机验证", InfoColor),
-    AUTH("身份认证", Ok),
-    ACCESS("访问日志", Brand);
+    AUTH("身份认证", Ok);
 
     companion object {
         fun of(index: Int): LogKind = entries.getOrElse(index) { EVENT }
@@ -152,7 +154,6 @@ class LogsVm : ViewModel() {
                     LogKind.ACL -> api.recordsAcl(q)
                     LogKind.CHALLENGE -> api.recordsChallenge(q)
                     LogKind.AUTH -> api.recordsAuthDefense(q)
-                    LogKind.ACCESS -> api.recordsAccess(q)
                 }
                 val raw = Resp.obj(body)
                 entries = Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map { buildEntry(it) }
@@ -209,8 +210,8 @@ class LogsVm : ViewModel() {
     private fun buildEntry(o: JsonObject): LogEntry {
         val ip = Resp.str(o, "src_ip", "ip", "client_ip", "remote_addr", "source_ip")
         val host = Resp.str(o, "host", "server_name", "domain", "dst_host", "server")
-        val url = Resp.str(o, "url", "uri", "path", "request_path", "target")
-        val rule = Resp.str(o, "rule_id", "attack_type", "type", "category", "task_name")
+        val url = Resp.str(o, "url", "uri", "path", "request_path", "target", "url_path")
+        val rule = Resp.str(o, "rule_id", "attack_type", "type", "category", "task_name", "policy_name")
         val hostPair = listOf(host, url).firstOrNull { it.isNotBlank() }
         val subtitleParts = mutableListOf<String>()
         if (ip.isNotBlank()) subtitleParts.add("来源 IP $ip")
@@ -221,22 +222,13 @@ class LogsVm : ViewModel() {
         val region = Resp.str(o, "province", "region", "country", "location")
         if (region.isNotBlank()) subtitleParts.add(region)
         return LogEntry(
-            id = Resp.str(o, "id", "uid", "uuid").ifBlank { Resp.l(o, "id").toString() },
+            id = Resp.str(o, "id", "uid", "uuid", "event_id").ifBlank { Resp.l(o, "id").toString() },
             title = hostPair ?: ip.ifBlank { "记录 ${System.currentTimeMillis()}" },
             subtitle = subtitleParts.joinToString(" · "),
-            attrLine = listOf(rule, timeOf(o)).filter { it.isNotBlank() }.joinToString(" · "),
+            // 时间统一走 TimeFmt：各接口的 timestamp(int) 与 created_at(string) 都能读成人能看懂的格式
+            attrLine = listOf(rule, TimeFmt.logTimeOf(o)).filter { it.isNotBlank() }.joinToString(" · "),
             raw = o
         )
-    }
-
-    private fun timeOf(o: JsonObject): String {
-        val raw = Resp.l(o, "timestamp", "time", "create_time", "created_at", "ts")
-        if (raw > 0) {
-            val ms = if (raw > 10_000_000_000L) raw else raw * 1000L
-            return SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(ms))
-        }
-        val str = Resp.str(o, "time_str", "time", "created_at", "datetime")
-        return if (str.isNotBlank() && !str.all { it.isDigit() }) str else ""
     }
 }
 
@@ -252,19 +244,26 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
         onDispose { }
     }
 
-    // 从首页指标卡跳转过来时，直接落到对应分类
+    // 从首页指标卡跳转过来时，直接落到对应分类。
+    // 必须做上界收口：路由 logs?tab={tab} 是外部可见的深链入口，
+    // 传进来的值超过页签数量时 TabRow(selectedTabIndex = 99) 会直接抛
+    // IndexOutOfBoundsException 崩掉整页。
     LaunchedEffect(initialTab) {
-        if (initialTab >= 0 && initialTab != vm.tab) {
-            vm.tab = initialTab
-            vm.setTab(account, initialTab)
+        val safe = initialTab.coerceIn(0, LOG_TABS.lastIndex)
+        if (initialTab >= 0 && safe != vm.tab) {
+            vm.tab = safe
+            vm.setTab(account, safe)
         }
     }
 
+    val safeTab = vm.tab.coerceIn(0, LOG_TABS.lastIndex)
+    LaunchedEffect(safeTab) { if (vm.tab != safeTab) vm.tab = safeTab }
+
     Column(Modifier.fillMaxSize()) {
-        TabRow(selectedTabIndex = vm.tab) {
+        TabRow(selectedTabIndex = safeTab) {
             LOG_TABS.forEachIndexed { i, t ->
                 Tab(
-                    selected = vm.tab == i,
+                    selected = safeTab == i,
                     onClick = { vm.setTab(account, i) },
                     text = { Text(t, style = MaterialTheme.typography.labelMedium) }
                 )
@@ -294,7 +293,9 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
             EmptyBox(if (vm.refreshing) "加载中…" else "本页暂无记录")
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
-                items(vm.entries) { e ->
+                // 日志翻页后内容完全换一批，必须给 key，否则按位复用会导致
+                // 「条目内容串位」；id 缺失时带下标兜底，避免 key 撞车崩溃
+                itemsIndexed(vm.entries, key = { i, e -> "${e.id}_$i" }) { _, e ->
                     LogRowView(entry = e, onClick = { vm.openDetail(account, e) })
                 }
                 item { Spacer(Modifier.height(80.dp)) }
@@ -414,10 +415,15 @@ private fun LogDetailDialog(
                     colors = CardDefaults.cardColors(containerColor = kind.color.copy(alpha = 0.10f))
                 ) {
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                        val logTime = TimeFmt.logTimeOf(raw)
+                        if (logTime.isNotBlank()) {
+                            KeyValueRow("发生时间", logTime, kind.color)
+                        }
                         KeyValueRow("来源 IP", Resp.str(raw, "src_ip", "ip", "client_ip", "remote_addr").ifBlank { "—" })
                         KeyValueRow("目标 Host", Resp.str(raw, "host", "server_name", "domain", "dst_host").ifBlank { "—" })
+                        KeyValueRow("所属站点", Resp.str(raw, "site_title", "site_name", "site_comment", "website").ifBlank { "—" })
                         KeyValueRow("请求方法", Resp.str(raw, "method", "http_method").ifBlank { "—" })
-                        KeyValueRow("请求 URL", Resp.str(raw, "url", "uri", "path", "request_path").ifBlank { "—" })
+                        KeyValueRow("请求 URL", Resp.str(raw, "url", "uri", "path", "request_path", "url_path").ifBlank { "—" })
                         KeyValueRow("状态码", Resp.l(raw, "status_code", "status", "code").takeIf { it > 0 }?.toString() ?: "—")
                         KeyValueRow("归属地区", Resp.str(raw, "province", "region", "country", "location").ifBlank { "—" })
                     }
@@ -521,6 +527,9 @@ private fun groupize(raw: JsonObject): List<Pair<String, List<Pair<String, Strin
         val text = when {
             v.isJsonPrimitive && v.asJsonPrimitive.isNumber -> v.asString
             v.isJsonPrimitive && v.asJsonPrimitive.isBoolean -> if (v.asBoolean) "是" else "否"
+            // 时间类字符串统一转成人能看懂的格式，避免详情页出现原始 ISO 串
+            key in TIME_KEYS -> TimeFmt.parseText(v.asString)
+                .takeIf { it > 0 }?.let { TimeFmt.full(it) } ?: v.asString
             v.isJsonPrimitive -> v.asString
             v.isJsonArray -> v.asJsonArray.size().let { "$it 项" }
             else -> continue
@@ -537,26 +546,45 @@ private fun groupize(raw: JsonObject): List<Pair<String, List<Pair<String, Strin
     return listOf("attack" to attack, "request" to request, "other" to other)
 }
 
+/**
+ * 字段名取自官方 OpenAPI 的日志模型
+ * （model.DetectLog / acl.Log / api.ChallengeLog / auth_defense.*）。
+ */
 private val ATTACK_KEYS = setOf(
-    "attack_type", "attack", "rule_id", "rule_name", "task_name", "category",
-    "engine", "event_type", "type", "level", "severity", "confidence",
-    "payload", "evidence", "detail", "reason", "cve", "cve_id", "log_id"
+    "attack_type", "attack", "rule_id", "rule_name", "rule_id_list", "short_rule_id",
+    "task_name", "category", "engine", "event_type", "type", "level", "severity",
+    "confidence", "risk_level", "payload", "evidence", "detail", "reason",
+    "cve", "cve_id", "log_id", "policy_name", "module", "reason", "query_key",
+    "block_min", "deny_count", "denied_count", "valid_before", "result"
 )
 
 private val REQUEST_KEYS = setOf(
     "user_agent", "useragent", "referer", "referrer", "cookie", "request_body",
-    "req_body", "body", "query", "headers", "req_header", "attack_detail",
-    "req_id", "trace_id", "x_forwarded_for"
+    "req_body", "body", "query", "query_string", "headers", "req_header",
+    "rsp_header", "rsp_body", "attack_detail", "req_id", "trace_id",
+    "x_forwarded_for", "decode_path", "method", "http_method", "status_code",
+    "ja4_fingerprint", "protocol", "dst_port", "src_port", "dst_ip"
+)
+
+private val TIME_KEYS = setOf(
+    "timestamp", "time_stamp", "time", "ts", "created_at", "updated_at",
+    "create_time", "start_at", "started_at", "end_at", "ended_at", "dur_sec",
+    "date", "datetime", "valid_before"
 )
 
 private val SKIP_KEYS = setOf(
-    "src_ip", "ip", "client_ip", "remote_addr", "source_ip",
-    "host", "server_name", "domain", "dst_host", "server",
-    "method", "http_method", "url", "uri", "path", "request_path",
+    "src_ip", "ip", "client_ip", "remote_addr", "source_ip", "socket_ip",
+    "host", "server_name", "domain", "dst_host", "server", "website",
+    "url", "uri", "path", "request_path", "url_path",
     "status_code", "status", "code",
-    "province", "region", "country", "location",
-    "id", "uid", "uuid", "timestamp", "time", "time_stamp",
-    "create_time", "created_at", "ts"
+    "province", "region", "country", "location", "city", "lat", "lng",
+    "id", "uid", "uuid", "event_id", "eventid",
+    "site_id", "site_uuid", "site_title", "site_name", "site_comment",
+    "site_icon", "site_server_names", "user_id", "username", "uuid",
+    "policy_id", "auth_source_id", "third_id", "source_type", "status",
+    "timestamp", "time_stamp", "time", "ts", "created_at", "updated_at",
+    "create_time", "start_at", "started_at", "end_at", "ended_at",
+    "date", "datetime"
 )
 
 private val FEATURE_LABELS = mapOf(
@@ -564,6 +592,8 @@ private val FEATURE_LABELS = mapOf(
     "attack" to "攻击描述",
     "rule_id" to "命中规则 ID",
     "rule_name" to "命中规则",
+    "rule_id_list" to "命中规则组",
+    "short_rule_id" to "规则短 ID",
     "task_name" to "任务名称",
     "category" to "分类",
     "engine" to "检测引擎",
@@ -572,13 +602,30 @@ private val FEATURE_LABELS = mapOf(
     "level" to "危险等级",
     "severity" to "严重程度",
     "confidence" to "置信度",
+    "risk_level" to "风险等级",
+    "module" to "防护模块",
     "payload" to "攻击载荷",
     "evidence" to "判定依据",
     "detail" to "详情",
     "reason" to "命中原因",
     "cve" to "CVE 编号",
     "cve_id" to "CVE 编号",
-    "log_id" to "日志 ID"
+    "log_id" to "日志 ID",
+    "policy_name" to "命中策略",
+    "query_key" to "命中的 Key",
+    "block_min" to "封禁时长(分)",
+    "deny_count" to "累计拦截",
+    "denied_count" to "累计拦截",
+    "count" to "次数",
+    "trigger_count" to "触发次数",
+    "pass_count" to "通过次数",
+    "dur_sec" to "持续时长(秒)",
+    "valid_before" to "有效期至",
+    "result" to "处置结果",
+    "finished" to "是否结束",
+    "rule_type" to "规则类型",
+    "period" to "周期",
+    "source_type" to "来源类型"
 )
 
 private val REQUEST_LABELS = mapOf(
@@ -589,22 +636,28 @@ private val REQUEST_LABELS = mapOf(
     "cookie" to "Cookie",
     "request_body" to "请求体",
     "req_body" to "请求体",
+    "rsp_body" to "响应体",
     "body" to "请求体",
+    "query_string" to "查询串",
     "query" to "查询串",
     "headers" to "请求头",
     "req_header" to "请求头",
+    "rsp_header" to "响应头",
+    "decode_path" to "解码后路径",
     "attack_detail" to "报文详情",
     "req_id" to "请求 ID",
     "trace_id" to "Trace ID",
+    "ja4_fingerprint" to "JA4 指纹",
+    "protocol" to "协议",
+    "dst_port" to "目标端口",
+    "src_port" to "来源端口",
+    "dst_ip" to "目标 IP",
     "x_forwarded_for" to "X-Forwarded-For"
 )
 
 private val OTHER_LABELS = mapOf(
     "action" to "处置动作",
-    "site_id" to "站点 ID",
-    "site_name" to "站点名称",
     "node_id" to "节点 ID",
     "is_waf" to "是否 WAF 响应",
-    "duration" to "耗时",
-    "time_stamp" to "时间"
+    "duration" to "耗时"
 )

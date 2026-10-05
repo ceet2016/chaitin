@@ -253,18 +253,10 @@ object Resp {
             val el = o.get(k) ?: continue
             if (el.isJsonNull || !el.isJsonPrimitive) continue
             val p = el.asJsonPrimitive
-            if (p.isNumber) return clockLabel(p.asLong)
+            if (p.isNumber) return TimeFmt.clock(TimeFmt.toMillis(p.asLong))
             if (p.isString && p.asString.isNotBlank()) return p.asString.take(16)
         }
         return ""
-    }
-
-    private fun clockLabel(raw: Long): String = try {
-        val ms = if (raw > 10_000_000_000L) raw else raw * 1000L
-        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-            .format(java.util.Date(ms))
-    } catch (e: Exception) {
-        ""
     }
 
     /**

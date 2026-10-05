@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -38,9 +39,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,6 +57,7 @@ import androidx.navigation.NavHostController
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.uniomo.wafce.core.Resp
 import com.uniomo.wafce.core.UiState
@@ -66,6 +70,8 @@ import com.uniomo.wafce.ui.components.EmptyBox
 import com.uniomo.wafce.ui.components.KeyValueRow
 import com.uniomo.wafce.ui.components.SectionCard
 import com.uniomo.wafce.ui.components.TagChip
+import com.uniomo.wafce.ui.components.rememberMsgHost
+import com.uniomo.wafce.ui.Route
 import com.uniomo.wafce.ui.theme.Brand
 import com.uniomo.wafce.ui.theme.Danger
 import com.uniomo.wafce.ui.theme.InfoColor
@@ -84,6 +90,12 @@ data class SiteItem(
 
 class SitesVm : ViewModel() {
 
+    /**
+     * 请求代次。viewModel() 作用域是 NavBackStackEntry，切账号时本实例复用，
+     * 不校验的话旧账号慢返回的站点列表会覆盖新账号界面，用户甚至可能误删错账号的站点。
+     */
+    private var epoch = 0
+
     var state: UiState<List<SiteItem>> by mutableStateOf(UiState.Idle)
         private set
 
@@ -98,15 +110,27 @@ class SitesVm : ViewModel() {
     var message by mutableStateOf<String?>(null)
         private set
 
-    fun load(account: AccountProfile) {
+    fun ack() { message = null }
+
+    /**
+     * @param silent 已有数据时静默刷新。删除/保存后的重载必须走静默模式，
+     *                否则整个列表会闪成全屏「加载中…」，体验割裂。
+     */
+    fun load(account: AccountProfile, silent: Boolean = false) {
+        val my = ++epoch
         viewModelScope.launch {
-            state = UiState.Loading
+            val hasData = state is UiState.Success
+            if (!silent || !hasData) state = UiState.Loading
             state = try {
                 val body = ApiClient.apiFor(account).sites(mapOf("page" to "1", "page_size" to "100"))
                 val raw = Resp.obj(body)
                 val list = Resp.nodes(raw).ifEmpty { Resp.arr(body) }
+                if (my != epoch) return@launch
                 UiState.Success(list.map { parse(it) })
             } catch (e: Exception) {
+                if (my != epoch) return@launch
+                // 静默刷新失败时保留已有数据，不要把整页替换成错误页
+                if (silent && hasData) return@launch
                 UiState.Fail(e.readable(), e is com.uniomo.wafce.core.UnauthorizedException)
             }
         }
@@ -127,8 +151,6 @@ class SitesVm : ViewModel() {
     fun requestDelete(site: SiteItem) { pendingDelete = site }
 
     fun cancelDelete() { pendingDelete = null }
-
-    fun ack() { message = null }
 
     fun save(
         account: AccountProfile,
@@ -158,7 +180,7 @@ class SitesVm : ViewModel() {
                     api.createSite(body)
                 }
                 closeEditor()
-                load(account)
+                load(account, silent = true)
                 "保存成功"
             } catch (e: Exception) {
                 e.readable()
@@ -173,7 +195,7 @@ class SitesVm : ViewModel() {
             working = true
             message = try {
                 ApiClient.apiFor(account).deleteSite(target.id)
-                load(account)
+                load(account, silent = true)
                 "站点已删除"
             } catch (e: Exception) {
                 e.readable()
@@ -213,19 +235,19 @@ fun SitesScreen(account: AccountProfile, nav: NavHostController) {
         onDispose { }
     }
 
-    vm.message?.let {
-        Column(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-        ) { Text(it, style = MaterialTheme.typography.bodySmall) }
-        androidx.compose.runtime.LaunchedEffect(it) {
-            kotlinx.coroutines.delay(2600)
-            vm.ack()
-        }
+    // 操作结果提示必须挂在 snackbarHost：写成 Scaffold 的兄弟节点会被其不透明背景盖住
+    val msgHost = rememberMsgHost()
+    LaunchedEffect(vm.message) {
+        val m = vm.message ?: return@LaunchedEffect
+        msgHost.show(m, long = true)
+        delay(2600)
+        vm.ack()
     }
 
     Scaffold(
         // 外层 MainScaffold 已处理系统栏，这里清零避免重复叠加导致顶部留白
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        snackbarHost = { msgHost.Host() },
         floatingActionButton = {
             FloatingActionButton(onClick = { vm.openNew() }) {
                 Icon(Icons.Default.Add, contentDescription = "新增站点")
@@ -239,10 +261,12 @@ fun SitesScreen(account: AccountProfile, nav: NavHostController) {
                 } else {
                     LazyColumn(Modifier.fillMaxSize()) {
                         item { Spacer(Modifier.height(6.dp)) }
-                        items(list, key = { it.id }) { site ->
+                        // key 带下标：服务端缺 id 时全部为 0，纯 id 会抛
+                        // "Key was already used" 导致整页崩溃
+                        itemsIndexed(list, key = { i, site -> "${site.id}_$i" }) { _, site ->
                             SiteRow(
                                 site = site,
-                                onOpen = { nav.navigate("site/${site.id}") },
+                                onOpen = { nav.navigate(Route.SiteDetail.replace("{id}", site.id.toString())) },
                                 onEdit = { vm.openEdit(site) },
                                 onDelete = { vm.requestDelete(site) }
                             )
@@ -269,7 +293,7 @@ fun SitesScreen(account: AccountProfile, nav: NavHostController) {
             title = { Text("删除站点") },
             text = { Text("确定删除站点「${target.displayName}」？删除后该域名将不再受保护。") },
             confirmButton = {
-                TextButton(onClick = { vm.confirmDelete(account) }) {
+                TextButton(onClick = { vm.confirmDelete(account) }, enabled = !vm.working) {
                     Text("删除", color = Danger)
                 }
             },
@@ -359,10 +383,13 @@ private fun SiteEditorDialog(
     onDismiss: () -> Unit,
     onSave: (domains: String, ports: String, upstreams: String, comment: String) -> Unit
 ) {
-    var domains by remember { mutableStateOf(original?.domains?.joinToString(",") ?: "") }
-    var ports by remember { mutableStateOf(original?.ports?.joinToString(",") ?: "80") }
-    var upstreams by remember { mutableStateOf(original?.upstreams?.joinToString(",") ?: "") }
-    var comment by remember { mutableStateOf(original?.comment ?: "") }
+    // 弹窗的存在状态在 ViewModel 里，旋转屏幕后弹窗会重建。
+    // 用 remember 的话用户填了一半的域名和上游地址会全部清空，故必须 rememberSaveable。
+    val key = original?.id ?: -1L
+    var domains by rememberSaveable(key) { mutableStateOf(original?.domains?.joinToString(",") ?: "") }
+    var ports by rememberSaveable(key) { mutableStateOf(original?.ports?.joinToString(",") ?: "80") }
+    var upstreams by rememberSaveable(key) { mutableStateOf(original?.upstreams?.joinToString(",") ?: "") }
+    var comment by rememberSaveable(key) { mutableStateOf(original?.comment ?: "") }
 
     AlertDialog(
         onDismissRequest = onDismiss,

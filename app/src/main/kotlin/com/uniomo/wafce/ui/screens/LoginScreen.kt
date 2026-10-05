@@ -27,9 +27,16 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,11 +58,18 @@ import com.uniomo.wafce.vm.AppViewModel
  */
 @Composable
 fun LoginScreen(vm: AppViewModel, account: AccountProfile, onCancel: (() -> Unit)? = null) {
-    var baseUrl by remember(account.id) { mutableStateOf(account.baseUrl.trimEnd('/')) }
-    var name by remember(account.id) { mutableStateOf(account.name) }
-    var token by remember { mutableStateOf("") }
-    var trustAll by remember(account.id) { mutableStateOf(account.trustAllCert) }
-    var error by remember { mutableStateOf("") }
+    var baseUrl by rememberSaveable(account.id) { mutableStateOf(account.baseUrl.trimEnd('/')) }
+    var name by rememberSaveable(account.id) { mutableStateOf(account.name) }
+    // token 必须带 account.id 作为 key：早期版本漏了，从账号 A 切到 B 时
+    // baseUrl/name 因 key 变化重置，token 却保留 A 的明文值，用户会直接把
+    // A 的凭据写进 B 的记录。Token 是长期凭据，泄漏面必须收死。
+    var token by rememberSaveable(account.id) { mutableStateOf("") }
+    var tokenVisible by rememberSaveable(account.id) { mutableStateOf(false) }
+    var trustAll by rememberSaveable(account.id) { mutableStateOf(account.trustAllCert) }
+    var error by rememberSaveable(account.id) { mutableStateOf("") }
+
+    // 用户一开始修改输入就把上次的错误清掉，否则改好了红字还挂着
+    fun clearErr() { if (error.isNotBlank()) error = "" }
 
     Column(
         modifier = Modifier
@@ -99,7 +113,7 @@ fun LoginScreen(vm: AppViewModel, account: AccountProfile, onCancel: (() -> Unit
 
         OutlinedTextField(
             value = baseUrl,
-            onValueChange = { baseUrl = it },
+            onValueChange = { baseUrl = it; clearErr() },
             label = { Text("控制台地址") },
             placeholder = { Text("https://192.168.1.10:9443") },
             singleLine = true,
@@ -117,11 +131,28 @@ fun LoginScreen(vm: AppViewModel, account: AccountProfile, onCancel: (() -> Unit
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(
             value = token,
-            onValueChange = { token = it },
+            onValueChange = { token = it.trim(); clearErr() },
             label = { Text("API Token") },
-            modifier = Modifier.fillMaxWidth(),
-            minLines = 3,
-            maxLines = 4
+            singleLine = true,
+            // Token 是长期有效的凭据，默认掩码显示，避免录屏/截图/肩窥泄漏
+            visualTransformation = if (tokenVisible) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Done
+            ),
+            trailingIcon = {
+                IconButton(onClick = { tokenVisible = !tokenVisible }) {
+                    Icon(
+                        if (tokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (tokenVisible) "隐藏 Token" else "显示 Token"
+                    )
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
         )
 
         Spacer(Modifier.height(12.dp))
@@ -173,9 +204,11 @@ fun LoginScreen(vm: AppViewModel, account: AccountProfile, onCancel: (() -> Unit
                     token.isBlank() -> error = "请填写 API Token"
                     else -> {
                         error = ""
+                        // 用 copy 而不是新建：AccountStore 在 id != 0 时会以传入对象
+                        // 整体覆盖旧记录，新建会导致 username / createdAt /
+                        // lastUsedAt / lastError 被默认值清空。
                         vm.loginWithToken(
-                            AccountProfile(
-                                id = account.id,
+                            account.copy(
                                 name = name.trim(),
                                 baseUrl = normalizeBaseUrl(baseUrl),
                                 trustAllCert = trustAll

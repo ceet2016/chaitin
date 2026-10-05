@@ -262,22 +262,39 @@ fun AboutScreen(
  *
  * 只做「触发检查」与「展示结论」，下载/安装的弹窗由上层 UpdateDialog 负责，
  * 避免同一时刻出现两个弹窗。
+ *
+ * 关键：弹窗关闭后 [UpdateVm.state] 会回到 Idle（否则弹窗会反复弹出），
+ * 因此这里额外读 [UpdateVm.lastResult] —— 否则用户点完「已是最新版本 → 确定」，
+ * 状态文案会瞬间退回「尚未检查」，看起来像结论被吃掉了。
  */
 @Composable
 private fun UpdatePanel(updateVm: UpdateVm) {
-    val checking = updateVm.state is UpdateState.Checking ||
-        updateVm.state is UpdateState.Downloading ||
-        updateVm.state is UpdateState.Installing
+    val state = updateVm.state
+    val last = updateVm.lastResult
+    // checking 判定不含 Installing：调起系统安装器后如果用户在那边点了取消，
+    // 状态会由 onInstallReturned 收回；这里若仍按 Installing 隐藏按钮，
+    // 万一 ON_RESUME 兜底没触发，用户就只能杀进程。
+    val checking = state is UpdateState.Checking || state is UpdateState.Downloading
 
-    val (statusText, statusColor) = when (val s = updateVm.state) {
-        UpdateState.Idle -> "尚未检查" to MaterialTheme.colorScheme.onSurfaceVariant
+    val (statusText, statusColor) = when (val s = state) {
+        UpdateState.Idle -> when {
+            // 弹窗已关闭但结论还在：继续如实展示上次检查结果
+            last != null && last.upToDate -> "已是最新版本" to Ok
+            last != null && !last.upToDate -> "有可用新版本" to Warn
+            else -> "尚未检查" to MaterialTheme.colorScheme.onSurfaceVariant
+        }
         UpdateState.Checking -> "正在检查…" to InfoColor
         is UpdateState.Downloading -> "下载中 ${s.percent}%" to InfoColor
         is UpdateState.Found -> "发现新版本 v${s.versionName}" to Warn
         UpdateState.UpToDate -> "已是最新版本" to Ok
         is UpdateState.Failed -> s.message to Danger
-        UpdateState.Installing -> "正在调起安装" to InfoColor
+        UpdateState.Installing -> "请在系统安装界面完成安装；返回本应用后会自动恢复" to InfoColor
     }
+
+    // 「已是最新版本」缺了 latest 版本号很抽象，补一行让人知道自己比的是什么
+    val remoteLine = last?.remoteVersion
+        ?.takeIf { it.isNotBlank() }
+        ?.let { "最新版 v$it" }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -316,6 +333,14 @@ private fun UpdatePanel(updateVm: UpdateVm) {
                     style = MaterialTheme.typography.labelSmall,
                     color = statusColor
                 )
+                if (remoteLine != null) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        remoteLine,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
             Spacer(Modifier.width(8.dp))
             if (checking) {

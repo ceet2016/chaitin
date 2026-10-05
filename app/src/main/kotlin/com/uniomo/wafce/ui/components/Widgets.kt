@@ -34,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -52,6 +53,7 @@ import com.uniomo.wafce.core.UiState
 import com.uniomo.wafce.ui.theme.Brand
 import com.uniomo.wafce.ui.theme.BrandDark
 import com.uniomo.wafce.ui.theme.NeutralSoft
+import kotlinx.coroutines.launch
 
 val CardShape = RoundedCornerShape(16.dp)
 
@@ -84,8 +86,61 @@ fun <T> AsyncBox(
 
         is UiState.Fail -> ErrorBox(message = state.message, onRetry = onRetry, modifier = modifier)
 
-        is UiState.Success -> content(state.data)
+        is UiState.Success -> Box(modifier = modifier) { content(state.data) }
     }
+}
+
+/**
+ * 统一的「操作结果提示」宿主。
+ *
+ * 必须挂在 Scaffold 的 snackbarHost 上，不能像早期版本那样写成 Scaffold 的兄弟节点：
+ * Scaffold 内部用不透明背景铺满全屏并后绘制，会把提示条完全遮住，
+ * 结果是所有写操作的失败原因用户一条都看不到。
+ *
+ * 用法：
+ * ```
+ * val snack = rememberMsgHost()
+ * Scaffold(snackbarHost = { snack.Host() }) { ... }
+ * ```
+ */
+class MsgHost internal constructor(
+    private val state: androidx.compose.material3.SnackbarHostState,
+    private val scope: kotlinx.coroutines.CoroutineScope
+) {
+    /** 展示一条提示；重复调用会排队，不会互相覆盖 */
+    fun show(text: String, long: Boolean = false) {
+        if (text.isBlank()) return
+        scope.launch {
+            state.currentSnackbarData?.dismiss()
+            state.showSnackbar(text, duration = if (long) {
+                androidx.compose.material3.SnackbarDuration.Long
+            } else {
+                androidx.compose.material3.SnackbarDuration.Short
+            })
+        }
+    }
+
+    /** 长期展示（如正在下载），供调用方后续手动 dismiss */
+    suspend fun showBlocking(text: String) {
+        state.currentSnackbarData?.dismiss()
+        state.showSnackbar(text, duration = androidx.compose.material3.SnackbarDuration.Indefinite)
+    }
+
+    suspend fun dismiss() {
+        state.currentSnackbarData?.dismiss()
+    }
+
+    @Composable
+    fun Host(modifier: Modifier = Modifier) {
+        androidx.compose.material3.SnackbarHost(hostState = state, modifier = modifier)
+    }
+}
+
+@Composable
+fun rememberMsgHost(): MsgHost {
+    val state = remember { androidx.compose.material3.SnackbarHostState() }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    return remember(state, scope) { MsgHost(state, scope) }
 }
 
 @Composable
@@ -316,6 +371,34 @@ fun HeroMetric(label: String, value: String, modifier: Modifier = Modifier) {
             label,
             style = MaterialTheme.typography.labelSmall,
             color = Color.White.copy(alpha = 0.8f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/**
+ * 浅色卡片里的指标块（对应控制台「流量分析」页的指标卡）。
+ *
+ * 与 [HeroMetric] 的区别：HeroMetric 是白字、固定用在深色渐变 Hero 区；
+ * 这个走 MaterialTheme 的 onSurface，深浅色主题下都可读。
+ */
+@Composable
+fun FlowMetric(label: String, value: String, accent: Color, modifier: Modifier = Modifier) {
+    Column(modifier.padding(vertical = 4.dp), horizontalAlignment = Alignment.Start) {
+        Text(
+            value,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            color = accent,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )

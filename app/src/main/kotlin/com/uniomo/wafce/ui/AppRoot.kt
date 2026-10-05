@@ -1,5 +1,6 @@
 package com.uniomo.wafce.ui
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,11 +34,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
@@ -121,20 +125,63 @@ fun AppRoot(vm: AppViewModel) {
                 vm.reload()
                 vm.ensureCurrentSession()
             }
+            val cur = vm.current
             when {
-                vm.current == null -> AccountsScreen(vm, firstLaunch = true)
-                vm.sessionState != SessionState.AUTHENTICATED -> LoginScreen(vm, vm.current!!)
-                else -> MainScaffold(vm, vm.current!!)
+                cur == null -> AccountsScreen(vm, firstLaunch = true)
+                // UNKNOWN 表示「尚未校验完成」，不能当登录态处理，
+                // 否则每次冷启动都会先闪一下登录页
+                vm.sessionState == SessionState.UNKNOWN -> SessionChecking()
+                vm.sessionState != SessionState.AUTHENTICATED ->
+                    LoginScreen(vm, cur, onCancel = { vm.beginManageAccounts() })
+                else -> MainScaffold(vm, cur)
             }
         }
     }
 }
 
+@Composable
+private fun SessionChecking() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        androidx.compose.material3.CircularProgressIndicator(
+            modifier = Modifier.size(28.dp),
+            strokeWidth = 2.5.dp
+        )
+    }
+}
+
+/**
+ * @param sessionKey 参与 NavController 的 key。
+ *   rememberNavController 内部是 rememberSaveable，会写进 SavedStateRegistry；
+ *   退出登录后 MainScaffold 离开组合、重新登录时同一 slot 可能被还原成
+ *   上一个账号的深栈（返回键能回到已登录页面）。用会话序号做 key 强制重建。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
+private fun MainScaffold(vm: AppViewModel, account: AccountProfile, sessionKey: Long = vm.sessionEpoch) {
+    key(sessionKey) {
+        MainScaffoldInner(vm, account)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MainScaffoldInner(vm: AppViewModel, account: AccountProfile) {
     val nav = rememberNavController()
     val updateVm: UpdateVm = viewModel()
+
+    // 系统安装界面是独立 Activity，用户在其中点「取消」时我们拿不到任何回调，
+    // 只能靠本App 重新回到前台（ON_RESUME）把Installing 状态收回来。
+    // 否则「检查更新」按钮会被进度圈永久顶替，只能杀进程恢复。
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                updateVm.onInstallReturned()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
     val backStack by nav.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     var sheetOpen by remember { mutableStateOf(false) }
@@ -169,8 +216,14 @@ private fun MainScaffold(vm: AppViewModel, account: AccountProfile) {
         bottomBar = {
             NavigationBar {
                 navItems.forEach { item ->
-                    val selected = currentRoute == item.route ||
-                        item.aliases.any { it.substringBefore("?") == currentRoute }
+                    // 带参路由（logs?tab={tab}）下 Nav Compose 返回的是**路由模板**而非
+                    // 填充后的路径，所以比较前必须把两边都截到「?」之前。
+                    // 早期版本只截 alias 一侧，导致从概览页跳日志/防护时底栏整条不亮。
+                    val base = currentRoute?.substringBefore("?")
+                    val selected = base != null && (
+                        base == item.route ||
+                            item.aliases.any { it.substringBefore("?") == base }
+                        )
                     NavigationBarItem(
                         selected = selected,
                         onClick = { nav.navigateToTab(item.route) },
@@ -308,13 +361,24 @@ private fun AccountSwitcherSheet(vm: AppViewModel, onDismiss: () -> Unit, onMana
     }
 }
 
-private fun titleOf(route: String?): String = when (route) {
-    Route.Sites -> "防护站点"
-    Route.Protect -> "防护配置"
-    Route.Logs -> "日志中心"
-    Route.System -> "系统管理"
-    Route.SiteDetail -> "站点详情"
-    else -> "总览"
+/**
+ * 顶栏标题。
+ *
+ * 必须先截掉 `?tab={tab}` 再匹配：带参路由下 destination.route 返回的是模板串，
+ * 直接用 when(route) 全落进 else，从概览跳日志页时标题会显示成「总览」。
+ */
+private fun titleOf(route: String?): String {
+    val base = route?.substringBefore("?")
+    return when (base) {
+        Route.Dashboard -> "总览"
+        Route.Sites -> "防护站点"
+        Route.Protect -> "防护配置"
+        Route.Logs -> "日志中心"
+        Route.System -> "系统管理"
+        Route.About -> "关于"
+        Route.SiteDetail -> "站点详情"
+        else -> "总览"
+    }
 }
 
 private fun shortUrl(url: String): String =

@@ -54,22 +54,41 @@ interface SafeLineApi {
     /**
      * 访问量 / 拦截量趋势。
      *
-     * 这两个接口属于控制台内部接口，路径与可用性随版本变化：
-     * 社区版实测 /api/stat/requests 与 /api/stat/intercepts 可用，
-     * 老版本则是 /api/dashboard/requests、/api/dashboard/intercepts。
-     * 客户端通过 [rawGet] 依次尝试，命中任一即可，不做硬编码假设。
+     * 路径与参数以长亭官方 OpenAPI 为准（chaitin/workspace-cli 的
+     * products/safeline-ce/openapi.json，basePath = /api）：
+     * - GET /api/stat/advance/trend/access    访问趋势
+     * - GET /api/stat/advance/trend/intercept 拦截趋势
+     * 两者都接受 begin_time / end_time（秒级时间戳）与可选 site_id。
+     *
+     * 注意：advance 系列在部分版本属商业版能力，社区版可能返回
+     * 403 license required，因此客户端保留了多路径回退，
+     * 由 [ApiClient.probeTrend] 按候选顺序试探。
      */
-    @GET("api/stat/requests")
-    suspend fun statRequests(@QueryMap q: Map<String, String>): JsonObject
+    @GET("api/stat/advance/trend/access")
+    suspend fun trendAccess(@QueryMap q: Map<String, String>): JsonObject
 
-    @GET("api/stat/intercepts")
-    suspend fun statIntercepts(@QueryMap q: Map<String, String>): JsonObject
+    @GET("api/stat/advance/trend/intercept")
+    suspend fun trendIntercept(@QueryMap q: Map<String, String>): JsonObject
+
+    /**
+     * 访问侧汇总指标。返回模型为 stat.AdvanceAccessRes：
+     * access（请求次数）、pv（访问次数）、session（独立访客 UV）、ip（独立 IP）。
+     * 参数与趋势接口一致：秒级 begin_time / end_time，可选 site_id。
+     */
+    @GET("api/stat/advance/access")
+    suspend fun statAdvanceAccess(@QueryMap q: Map<String, String>): JsonObject
+
+    /**
+     * 拦截侧汇总指标。返回模型为 stat.AdvanceAttackRes：
+     * attack_ip（攻击 IP 数）、intercept（拦截次数）。
+     */
+    @GET("api/stat/advance/attack")
+    suspend fun statAdvanceAttack(@QueryMap q: Map<String, String>): JsonObject
 
     /**
      * 安全态势统计 —— 社区版可用。
      * 旧版 dashboard 系列接口在 9.x 已移除；stat/advance 系列为商业版能力，
      * 社区版请求会返回 403 license required，因此仪表盘以本接口为准。
-     * 注意：注释里不要写带星号的路径通配，否则会触发 Kotlin 嵌套块注释。
      */
     @GET("api/open/security_posture/statistics")
     suspend fun securityPosture(): JsonObject
@@ -212,9 +231,10 @@ interface SafeLineApi {
     @GET("api/open/records/auth_defense")
     suspend fun recordsAuthDefense(@QueryMap q: Map<String, String>): JsonObject
 
-    /** 访问日志（放行） */
-    @GET("api/open/records/access")
-    suspend fun recordsAccess(@QueryMap q: Map<String, String>): JsonObject
+    // 注意：官方 OpenAPI 中**没有**访问日志列表接口。
+    // 日志类只暴露 /open/records（攻击日志）与 /open/records/rule（黑白名单命中日志）；
+    // 控制台「流量分析」页的访问数据来自统计聚合接口，而非日志列表。
+    // 因此客户端不再声明 /api/open/records/access —— 该路径在雷池上恒为 404。
 
     // ===================== 系统管理 =====================
 

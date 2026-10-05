@@ -51,6 +51,14 @@ class AppViewModel : ViewModel() {
     var sessionState: SessionState by mutableStateOf(SessionState.UNKNOWN)
         private set
 
+    /**
+     * 会话世代计数。每次切换账号 / 退出登录都自增，
+     * AppRoot 用它作为 MainScaffold 的 key，强制重建 NavController，
+     * 否则 rememberSaveable 会把上一个账号的返回栈（含深链页）还原回来。
+     */
+    var sessionEpoch by mutableStateOf(0L)
+        private set
+
     var busy: Boolean by mutableStateOf(false)
         private set
 
@@ -63,6 +71,7 @@ class AppViewModel : ViewModel() {
             .onEach { id ->
                 if (id == -1L || current?.id == id) {
                     sessionState = SessionState.NEED_LOGIN
+                    sessionEpoch++
                 }
             }
             .launchIn(viewModelScope)
@@ -84,11 +93,15 @@ class AppViewModel : ViewModel() {
         AccountStore.setCurrent(id)
         current = AccountStore.current()
         sessionState = SessionState.UNKNOWN
+        sessionEpoch++
+        // 清理上一个账号的 UI 态，避免旧账号的操作结果 toast 带到新账号界面
+        toast = null
+        busy = false
         viewModelScope.launch { ensureSession(target) }
     }
 
     /**
-     * 进入「实例管理」页：刷新列表后再清空当前选中，触发 AppRoot 渲染账号列表，
+ * 进入「实例管理」页：刷新列表后再清空当前选中，触发 AppRoot 渲染账号列表，
      * 从而支持在已登录状态下继续添加/删除实例。
      *
      * 注意顺序：必须先 reload 再清空，否则 reload() 会把 current 重新填回来，
@@ -101,7 +114,13 @@ class AppViewModel : ViewModel() {
 
     /** 从实例管理页回到某个账号 */
     fun focusAccount(id: Long) {
-        current = AccountStore.all().firstOrNull { it.id == id } ?: accounts.firstOrNull()
+        val target = AccountStore.all().firstOrNull { it.id == id } ?: accounts.firstOrNull()
+        current = target
+        // 必须重置为 UNKNOWN 触发重新校验：用户在实例管理页停留期间 Token 可能已过期，
+        // 若沿用 AUTHENTICATED 会直接进主界面，所有接口 401 后才被踢回来。
+        sessionState = SessionState.UNKNOWN
+        sessionEpoch++
+        target?.let { viewModelScope.launch { ensureSession(it) } }
     }
 
     fun saveAccount(profile: AccountProfile, secret: AccountSecret? = null): Long {
@@ -117,13 +136,29 @@ class AppViewModel : ViewModel() {
         if (current == null) sessionState = SessionState.NEED_LOGIN
     }
 
+    /**
+     * 退出登录。
+     *
+     * 注意必须 [ApiClient.invalidate]：本客户端只用 API Token 接入，鉴权头来自
+     * AccountStore 里持久化的 token（不存于 SessionStore），只清 SessionStore 等于没登出，
+     * 缓存的 OkHttp 实例会继续带着有效 token 发请求。
+     */
     fun logout(id: Long = current?.id ?: -1L) {
-        val acc = accounts.firstOrNull { it.id == id } ?: return
+        val acc = accounts.firstOrNull { it.id == id }
+        if (acc == null) {
+            // 从实例管理页触发时current 为 null，这里明确置态而不是静默无操作
+            sessionState = SessionState.NEED_LOGIN
+            sessionEpoch++
+            return
+        }
         viewModelScope.launch {
+            // 本地登出不依赖服务端结果，失败也无需阻塞界面
             runCatching { ApiClient.apiFor(acc).logout() }
         }
         SessionStore.clear(id)
+        ApiClient.invalidate(id)
         sessionState = SessionState.NEED_LOGIN
+        sessionEpoch++
     }
 
     // ---------------- 会话保障 ----------------

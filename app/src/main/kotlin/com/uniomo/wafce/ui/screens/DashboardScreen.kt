@@ -6,11 +6,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -53,15 +56,23 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.Locale
 import com.uniomo.wafce.core.Resp
+import com.uniomo.wafce.core.TimeFmt
 import com.uniomo.wafce.core.UiState
 import com.uniomo.wafce.core.readable
+import com.uniomo.wafce.data.net.AccessSummary
 import com.uniomo.wafce.data.net.ApiClient
+import com.uniomo.wafce.data.net.ErrorStatusSummary
+import com.uniomo.wafce.data.net.GeoItem
+import com.uniomo.wafce.data.net.GeoRank
+import com.uniomo.wafce.data.net.InterceptSummary
 import com.uniomo.wafce.data.store.AccountProfile
 import com.uniomo.wafce.ui.components.AsyncBox
 import com.uniomo.wafce.ui.components.CardShape
 import com.uniomo.wafce.ui.components.EmptyBox
 import com.uniomo.wafce.ui.components.HeroHeader
+import com.uniomo.wafce.ui.components.FlowMetric
 import com.uniomo.wafce.ui.components.HeroMetric
 import com.uniomo.wafce.ui.components.SectionCard
 import com.uniomo.wafce.ui.components.StatCard
@@ -72,9 +83,6 @@ import com.uniomo.wafce.ui.theme.InfoColor
 import com.uniomo.wafce.ui.theme.Ok
 import com.uniomo.wafce.ui.theme.Warn
 import java.text.DecimalFormat
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 仪表盘页内的跳转目标。
@@ -96,12 +104,13 @@ sealed interface DashTarget {
 /**
  * 仪表盘数据。
  *
- * 数据源取舍（雷池 9.4.x 社区版实测）：
+ * 数据源取舍（以长亭官方 OpenAPI 为准，basePath=/api）：
  * - 各日志接口的 total 计数在社区版是真实数据，作为拦截类指标的主来源
- * - /stat/qps 提供实时 QPS 序列
- * - 访问量与拦截量趋势走 /stat/requests、/stat/intercepts，
- *   老版本回退到 /dashboard/requests、/dashboard/intercepts；
- *   两者都拿不到时退化为「近 N 条日志按时间分桶」，保证图一定有内容
+ * - /api/stat/qps 提供实时 QPS 序列
+ * - 访问/拦截趋势走 /api/stat/advance/trend/{access,intercept}，
+ *   参数为秒级 begin_time / end_time；社区版回退 /api/stat/basic/{access,attack}。
+ *   时间窗按「近 24 小时 → 近 7 天」依次尝试，**都没有数据时整个卡片不渲染**
+ *   （不做日志分桶之类的估算，避免给用户看一个并非真实统计的图）
  * - security_posture 社区版多数返回 0，仅在有非零值时补充展示
  */
 data class DashboardData(
@@ -115,7 +124,7 @@ data class DashboardData(
     val ipGroupTotal: Int = 0,
     val certTotal: Int = 0,
     val qpsSeries: List<Float> = emptyList(),
-    /** 访问量趋势，元素为数值点 */
+    /** 访问量趋势，元素为数值点；为空表示无数据，卡片应整体隐藏 */
     val accessSeries: List<Float> = emptyList(),
     val accessLabels: List<String> = emptyList(),
     /** 拦截量趋势 */
@@ -125,7 +134,28 @@ data class DashboardData(
     val posture: Map<String, Long> = emptyMap(),
     /** 趋势数据来源说明，用于在页面上诚实标注 */
     val accessSource: String = "",
-    val blockSource: String = ""
+    val blockSource: String = "",
+    /**
+     * 访问侧汇总（对应控制台「流量分析」页的指标卡）。
+     * null 表示该版本控制台不提供此统计，卡片应整体隐藏而不是显示 0。
+     */
+    val accessSummary: AccessSummary? = null,
+    /** 拦截侧汇总 */
+    val interceptSummary: InterceptSummary? = null,
+    /** 汇总指标的时间窗标签，用于标明这些数字的统计范围 */
+    val summaryWindow: String = "",
+    /**
+     * 错误状态码统计（4xx / 5xx）。
+     * 对应控制台「流量分析」页的「错误统计」区块；社区版 OpenAPI 未公开该接口，
+     * 探测不到时为 null，UI 层整体隐藏。
+     */
+    val errorSummary: ErrorStatusSummary? = null,
+    /**
+     * 来源地分布排行（国家 / 省份）。
+     * 对应控制台「流量分析」页的地理位置区块；社区版未公开该接口，
+     * 探测不到时为 null，UI 层整体隐藏。
+     */
+    val geoRank: GeoRank? = null
 )
 
 data class RealtimeEvent(
@@ -189,16 +219,36 @@ class DashboardVm : ViewModel() {
             val vRealtime = async { runCatching { api.securityRealtime(emptyMap()) } }
             val vPosture = async { runCatching { api.securityPosture() } }
 
-            // 趋势：优先内部统计接口，失败则用日志分桶兜底
+            // 趋势：近 24 小时优先，无数据再退近 7 天；两者皆无则不渲染卡片
             val vAccess = async { trend(ACCESS_TREND_PATHS) }
             val vBlock = async { trend(BLOCK_TREND_PATHS) }
-            val vEventsList = async { logBuckets { api.events(mapOf("page" to "1", "page_size" to "100")) } }
-            val vAclList = async { logBuckets { api.recordsAcl(mapOf("page" to "1", "page_size" to "100")) } }
 
             val access = vAccess.await()
             val block = vBlock.await()
-            val fallbackAccess = vEventsList.await()
-            val fallbackBlock = vAclList.await()
+
+            // 汇总指标与趋势共用同一个时间窗，避免「卡片写 24 小时、数字却是 7 天」
+            val winLabel = access.third.substringBefore(" · ").ifBlank {
+                block.third.substringBefore(" · ")
+            }
+            val winSec = TREND_WINDOWS.firstOrNull { it.first == winLabel }?.second
+                ?: 24L * 3600L
+            val nowSec = System.currentTimeMillis() / 1000L
+
+            // 汇总指标取不到就返回 null，UI 层隐藏整个区块（不显示假 0）
+            val accessSum = async {
+                ApiClient.probeAccessSummary(targetId, ACCESS_SUMMARY_PATHS, nowSec - winSec, nowSec)
+            }
+            val interceptSum = async {
+                ApiClient.probeInterceptSummary(targetId, INTERCEPT_SUMMARY_PATHS, nowSec - winSec, nowSec)
+            }
+            // 4xx/5xx：社区版未公开该接口，只做候选探测，取不到就整块隐藏
+            val errorSum = async {
+                ApiClient.probeErrorStatusSummary(targetId, ERROR_SUMMARY_PATHS, nowSec - winSec, nowSec)
+            }
+            // 来源地分布：同样未公开，只做候选探测
+            val geoRank = async {
+                ApiClient.probeGeoRank(targetId, GEO_PATHS, nowSec - winSec, nowSec)
+            }
 
             DashboardData(
                 version = versionOf(vSystem.await().getOrNull()),
@@ -211,71 +261,46 @@ class DashboardVm : ViewModel() {
                 ipGroupTotal = totalOf(vIpGroup.await().getOrNull()).toInt(),
                 certTotal = totalOf(vCert.await().getOrNull()).toInt(),
                 qpsSeries = qpsOf(vQps.await().getOrNull()),
-                accessSeries = access.first.ifEmpty { fallbackAccess.first },
-                accessLabels = access.second.ifEmpty { fallbackAccess.second },
-                blockSeries = block.first.ifEmpty { fallbackBlock.first },
-                blockLabels = block.second.ifEmpty { fallbackBlock.second },
+                accessSeries = access.first,
+                accessLabels = access.second,
+                blockSeries = block.first,
+                blockLabels = block.second,
                 realtime = realtimeOf(vRealtime.await().getOrNull()),
                 posture = postureOf(vPosture.await().getOrNull()),
-                accessSource = if (access.first.isNotEmpty()) access.third else "日志分桶（近 100 条）",
-                blockSource = if (block.first.isNotEmpty()) block.third else "日志分桶（近 100 条）"
+                accessSource = access.third,
+                blockSource = block.third,
+                accessSummary = accessSum.await(),
+                interceptSummary = interceptSum.await(),
+                summaryWindow = winLabel,
+                errorSummary = errorSum.await(),
+                geoRank = geoRank.await()
             )
         }
     }
 
     /**
-     * 依次尝试多个统计路径，返回「数值序列 + 首尾标签 + 来源说明」。
-     * 全部失败时返回空列表，由调用方决定是否用日志分桶兜底。
+     * 按「近 24 小时 → 近 7 天」依次探测趋势接口。
+     *
+     * 返回 (数值序列, 首尾标签, 来源说明)；两个时间窗都没有数据时返回空列表，
+     * 由 UI 决定隐藏整个卡片 —— 不做任何形式的估算兜底。
      */
     private suspend fun trend(paths: List<String>): Triple<List<Float>, List<String>, String> {
-        val pts = ApiClient.probeSeries(targetId, paths)
-        if (pts.isEmpty()) return Triple(emptyList(), emptyList(), "")
-        return Triple(
-            pts.map { it.value },
-            listOf(pts.first().label, pts.last().label),
-            paths.first()
-        )
+        val nowSec = System.currentTimeMillis() / 1000L
+        for ((label, windowSec) in TREND_WINDOWS) {
+            val pts = ApiClient.probeTrend(targetId, paths, nowSec - windowSec, nowSec)
+            if (pts.size >= 2) {
+                return Triple(
+                    pts.map { it.value },
+                    listOf(pts.first().label, pts.last().label),
+                    "$label · ${paths.first().substringAfterLast('/')}"
+                )
+            }
+        }
+        return Triple(emptyList(), emptyList(), "")
     }
 
     /** 趋势探测需要账号 id 来取 Retrofit 实例，随每次 fetch 记录一次 */
     private var targetId: Long = -1L
-
-    /**
-     * 兜底：取最近 N 条日志，按时间戳聚成 12 个时间桶。
-     * 至少能反映「最近这段时间的相对分布」，比一条空图有用。
-     */
-    private suspend fun logBuckets(block: suspend () -> JsonObject): Pair<List<Float>, List<String>> {
-        val body = runCatching { block() }.getOrNull() ?: return emptyList<Float>() to emptyList()
-        val nodes = runCatching { Resp.nodes(Resp.obj(body)) }.getOrNull().orEmpty()
-        if (nodes.isEmpty()) return emptyList<Float>() to emptyList()
-
-        val times = nodes.mapNotNull { tsOf(it) }
-        if (times.size < 4) return emptyList<Float>() to emptyList()
-
-        val newest = times.max()
-        val oldest = times.min()
-        val span = (newest - oldest).coerceAtLeast(1L)
-        val buckets = IntArray(BUCKET_COUNT)
-        for (t in times) {
-            val idx = (((t - oldest).toDouble() / span) * (BUCKET_COUNT - 1)).toInt()
-            buckets[idx.coerceIn(0, BUCKET_COUNT - 1)]++
-        }
-        val spanSec = span / BUCKET_COUNT
-        val labels = listOf(clockOf(oldest), clockOf(newest))
-        return buckets.map { it.toFloat() } to labels
-    }
-
-    private fun tsOf(o: JsonObject): Long? {
-        val raw = Resp.l(o, "timestamp", "time_stamp", "time", "create_time", "created_at", "ts")
-        if (raw <= 0) return null
-        return if (raw > 10_000_000_000L) raw else raw * 1000L
-    }
-
-    private fun clockOf(ms: Long): String = try {
-        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
-    } catch (e: Exception) {
-        ""
-    }
 
     /**
      * 切换自动刷新。方法名不能叫 setAutoRefresh——那会和 `private set`
@@ -346,13 +371,13 @@ class DashboardVm : ViewModel() {
             if (!el.isJsonObject) continue
             val o = el.asJsonObject
             val inner = Resp.firstObj(o) ?: o
-            val ts = Resp.l(o, "time_stamp", "timestamp", "time")
             out.add(
                 RealtimeEvent(
                     siteName = Resp.str(inner, "site_name", "host", "site").ifBlank { "—" },
                     ip = Resp.str(inner, "ip", "src_ip").ifBlank { "—" },
                     attackType = Resp.str(o, "attack_type", "event_type", "type").ifBlank { "安全事件" },
-                    timeText = if (ts > 0) formatTime(ts) else ""
+                    // time_stamp 是整数秒，统一交给 TimeFmt 处理量级判定
+                    timeText = TimeFmt.formatOf(o, TimeFmt.PAT_MINUTE_STAMP, "time_stamp", "timestamp", "time")
                 )
             )
             if (out.size >= 8) break
@@ -360,26 +385,60 @@ class DashboardVm : ViewModel() {
         out
     }.getOrDefault(emptyList())
 
-    private fun formatTime(sec: Long): String = try {
-        val ms = if (sec > 10_000_000_000L) sec else sec * 1000L
-        SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ms))
-    } catch (e: Exception) {
-        ""
-    }
-
     private companion object {
-        const val BUCKET_COUNT = 12
-
-        /** 访问量趋势的候选路径：新版 stat 优先，回退老版 dashboard */
-        val ACCESS_TREND_PATHS = listOf(
-            "api/stat/requests",
-            "api/dashboard/requests"
+        /** 趋势时间窗：先试 24 小时，再试 7 天。都无数据则隐藏卡片。 */
+        val TREND_WINDOWS = listOf(
+            "近 24 小时" to 24L * 3600L,
+            "近 7 天" to 7L * 24L * 3600L
         )
 
-        /** 拦截量趋势的候选路径 */
+        /** 访问趋势候选路径：官方 /stat/advance/trend/access */
+        val ACCESS_TREND_PATHS = listOf(
+            "api/stat/advance/trend/access"
+        )
+
+        /** 拦截趋势候选路径：官方 /stat/advance/trend/intercept */
         val BLOCK_TREND_PATHS = listOf(
-            "api/stat/intercepts",
-            "api/dashboard/intercepts"
+            "api/stat/advance/trend/intercept"
+        )
+
+        /**
+         * 访问侧汇总候选路径（请求次数 / PV / UV / 独立 IP）。
+         * 对应官方 stat.AdvanceAccessRes。
+         */
+        val ACCESS_SUMMARY_PATHS = listOf(
+            "api/stat/advance/access"
+        )
+
+        /** 拦截侧汇总候选路径（拦截次数 / 攻击 IP），对应 stat.AdvanceAttackRes */
+        val INTERCEPT_SUMMARY_PATHS = listOf(
+            "api/stat/advance/attack"
+        )
+
+        /**
+         * 4xx / 5xx 错误统计候选路径，对应 stat.AdvanceErrorStatusCodeRes。
+         *
+         * 该模型在官方 OpenAPI 的 definitions 里存在但没有任何 path 引用它，
+         * 社区版未公开；控制台「流量分析」页能显示说明服务端内部有数据，
+         * 这里按stat 系列的命名规律列候选，探测不到就整块隐藏（不显示假 0）。
+         */
+        val ERROR_SUMMARY_PATHS = listOf(
+            "api/stat/advance/error_status_code",
+            "api/stat/advance/error_statuscode",
+            "api/stat/advance/error-status-code",
+            "api/stat/advance/status_code",
+            "api/stat/advance/error"
+        )
+
+        /**
+         * 来源地分布候选路径，对应 model.ReportDataGeo。
+         * 同样未在paths 中公开，按 stat / report 两条线列候选。
+         */
+        val GEO_PATHS = listOf(
+            "api/stat/advance/geo",
+            "api/stat/advance/geo_info",
+            "api/report/geo",
+            "api/report/data"
         )
     }
 }
@@ -447,41 +506,230 @@ fun DashboardScreen(account: AccountProfile, onNavigate: (DashTarget) -> Unit = 
     }
 }
 
+/**
+ * 错误率格式化：保留两位小数百分比。
+ * 分母为 0 时返回 "—"，避免出现 NaN% / Infinity%。
+ */
+private fun pct(part: Long, total: Long): String {
+    if (total <= 0L) return "—"
+    val v = part.toDouble() * 100.0 / total.toDouble()
+    return String.format(Locale.CHINA, "%.2f%%", v)
+}
+
+/**
+ * 来源地排行列表：名称 + 计数 + 按占比长度的条形。
+ *
+ * 条形宽度按当前列表的最大值归一化，这样即使绝对值很小也能看出分布差异；
+ * 全0 时不画条（避免画一条长度为 0 的线看着像渲染错误）。
+ */
+@Composable
+private fun GeoRankList(
+    title: String,
+    items: List<GeoItem>,
+    fmt: DecimalFormat,
+    color: androidx.compose.ui.graphics.Color
+) {
+    if (items.isEmpty()) return
+    val maxCount = items.maxOf { it.count }.coerceAtLeast(1L)
+    Column {
+        Text(
+            title,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(6.dp))
+        items.forEach { item ->
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    item.name,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                // 背景条：Base 主题下用 surfaceVariant，深色下自动变暗
+                Box(
+                    Modifier
+                        .weight(2f)
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    val ratio = (item.count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f)
+                    if (item.count > 0L && ratio > 0f) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth(ratio)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(color.copy(alpha = 0.75f))
+                        )
+                    }
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    fmt.format(item.count),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
     val fmt = DecimalFormat("#,###")
     Column(Modifier.padding(bottom = 28.dp)) {
 
+        // ---------- 流量分析指标卡 ----------
+        // 对应控制台「流量分析」页的红框区域。取不到统计时整块隐藏，
+        // 不显示全 0 的假指标 —— 那比不显示更误导人。
+        val accessSum = data.accessSummary
+        val interceptSum = data.interceptSummary
+        if (accessSum != null || interceptSum != null) {
+            SectionCard(
+                title = "流量分析",
+                subtitle = data.summaryWindow.ifBlank { "统计窗口以服务端为准" }
+            ) {
+                Column {
+                    Row(Modifier.fillMaxWidth()) {
+                        if (accessSum != null) {
+                            FlowMetric("请求次数", fmt.format(accessSum.requests), Brand, Modifier.weight(1f))
+                            FlowMetric("访问 PV", fmt.format(accessSum.pageViews), InfoColor, Modifier.weight(1f))
+                            FlowMetric("访客 UV", fmt.format(accessSum.uniqueVisitors), Ok, Modifier.weight(1f))
+                            FlowMetric("独立 IP", fmt.format(accessSum.uniqueIps), Warn, Modifier.weight(1f))
+                        } else if (interceptSum != null) {
+                            FlowMetric(
+                                "拦截次数", fmt.format(interceptSum.intercept), Danger, Modifier.weight(1f)
+                            )
+                        }
+                    }
+                    if (accessSum != null && interceptSum != null) {
+                        Spacer(Modifier.height(10.dp))
+                        Row(Modifier.fillMaxWidth()) {
+                            FlowMetric("拦截次数", fmt.format(interceptSum.intercept), Danger, Modifier.weight(1f))
+                            FlowMetric("攻击 IP", fmt.format(interceptSum.attackIps), Warn, Modifier.weight(1f))
+                            Spacer(Modifier.weight(2f))
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- 错误统计（4xx / 5xx） ----------
+        // 对应控制台「流量分析」页的「错误统计」区块。
+        // 社区版 OpenAPI 未公开该接口（stat.AdvanceErrorStatusCodeRes 无path 引用），
+        // 探测不到就不渲染，不显示两个 0 让人误以为统计正常。
+        val errSum = data.errorSummary
+        if (errSum != null) {
+            // 错误率分母用请求次数；拿不到请求次数时只显示错误数，不编造分母
+            val totalReq = accessSum?.requests ?: 0L
+            SectionCard(
+                title = "错误统计",
+                subtitle = data.summaryWindow.ifBlank { "统计窗口以服务端为准" }
+            ) {
+                Column {
+                    Row(Modifier.fillMaxWidth()) {
+                        FlowMetric("4xx 错误数", fmt.format(errSum.error4xx), Warn, Modifier.weight(1f))
+                        FlowMetric("5xx 错误数", fmt.format(errSum.error5xx), Danger, Modifier.weight(1f))
+                        FlowMetric(
+                            "4xx 错误率",
+                            if (totalReq > 0L) pct(errSum.error4xx, totalReq) else "—",
+                            Warn,
+                            Modifier.weight(1f)
+                        )
+                        FlowMetric(
+                            "5xx 错误率",
+                            if (totalReq > 0L) pct(errSum.error5xx, totalReq) else "—",
+                            Danger,
+                            Modifier.weight(1f)
+                        )
+                    }
+                    if (totalReq <= 0L) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "错误率需要请求次数作为分母，当前实例未提供该统计",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+
+        // ---------- 来源地分布 ----------
+        // 对应控制台「流量分析」页的地理位置区块（地球图 + 国家排行）。
+        // 移动端不画 3D 地球（无 3D 依赖且交互价值低），改为排行列表：
+        // 同样一眼看出「流量来自哪、拦截来自哪」，且文字可被无障碍朗读。
+        val geo = data.geoRank
+        if (geo != null) {
+            SectionCard(
+                title = "来源地分布",
+                subtitle = data.summaryWindow.ifBlank { "统计窗口以服务端为准" }
+            ) {
+                Column {
+                    GeoRankList(
+                        title = "访问来源国家",
+                        items = geo.requestCountry,
+                        fmt = fmt,
+                        color = InfoColor
+                    )
+                    if (geo.interceptCountry.isNotEmpty()) {
+                        Spacer(Modifier.height(12.dp))
+                        GeoRankList(
+                            title = "拦截来源国家",
+                            items = geo.interceptCountry,
+                            fmt = fmt,
+                            color = Danger
+                        )
+                    }
+                    if (geo.requestProvince.isNotEmpty()) {
+                        Spacer(Modifier.height(12.dp))
+                        GeoRankList(
+                            title = "访问来源省份",
+                            items = geo.requestProvince,
+                            fmt = fmt,
+                            color = Ok
+                        )
+                    }
+                }
+            }
+        }
+
         // ---------- 实时趋势 ----------
-        SectionCard(
-            title = "实时访问趋势",
-            subtitle = "近时段请求量 · 来源 ${data.accessSource.ifBlank { "—" }}"
-        ) {
-            if (data.accessSeries.size > 1) {
+        // 无数据时整块不渲染：宁可少一个卡片，也不给用户看一个并非真实统计的图
+        if (data.accessSeries.size > 1) {
+            SectionCard(
+                title = "访问趋势",
+                subtitle = "${data.accessSource.ifBlank { "统计接口" }} · 共 ${data.accessSeries.size} 个数据点"
+            ) {
                 TrendChart(
                     points = data.accessSeries,
                     color = InfoColor,
                     height = 110.dp,
                     labels = data.accessLabels
                 )
-            } else {
-                EmptyBox("暂无访问趋势数据")
             }
         }
 
-        SectionCard(
-            title = "实时拦截趋势",
-            subtitle = "近时段拦截量 · 来源 ${data.blockSource.ifBlank { "—" }}"
-        ) {
-            if (data.blockSeries.size > 1) {
+        if (data.blockSeries.size > 1) {
+            SectionCard(
+                title = "拦截趋势",
+                subtitle = "${data.blockSource.ifBlank { "统计接口" }} · 共 ${data.blockSeries.size} 个数据点"
+            ) {
                 TrendChart(
                     points = data.blockSeries,
                     color = Danger,
                     height = 110.dp,
                     labels = data.blockLabels
                 )
-            } else {
-                EmptyBox("暂无拦截趋势数据")
             }
         }
 
@@ -528,7 +776,7 @@ private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
                     card("防护模块", "配置", Brand, Icons.Default.Security, "语义分析 / Bot 等", DashTarget.ProtectTab("mode")),
                     card("频率限制", "配置", Warn, Icons.Default.Block, "CC 防护策略", DashTarget.ProtectTab("acl")),
                     card("黑白名单", "管理", Danger, Icons.Default.Groups, "白名单 / 黑名单", DashTarget.ProtectTab("rule")),
-                    card("访问日志", "查看", InfoColor, Icons.Default.TrendingUp, "实时请求记录", DashTarget.LogTab(4))
+                    card("攻击日志", "查看", InfoColor, Icons.Default.TrendingUp, "全部攻击记录", DashTarget.LogTab(0))
                 )
             )
         }
@@ -560,8 +808,9 @@ private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
 
         SectionCard("数据说明") {
             Text(
-                "拦截类指标取自各日志接口的真实累计计数；访问与拦截趋势优先使用控制台内部统计接口，" +
-                    "接口不可用时按最近 100 条日志的时间分布分桶估算，仅反映相对趋势。" +
+                "拦截类指标取自各日志接口的真实累计计数。" +
+                    "访问与拦截趋势通过官方统计接口 /api/stat/advance/trend/{access,intercept} 获取，" +
+                    "按秒级时间戳先取近 24 小时，无数据再取近 7 天；两个时间窗都没有数据时不显示该图。" +
                     "安全态势统计接口在社区版多数返回 0，因此仅在有非零值时展示。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

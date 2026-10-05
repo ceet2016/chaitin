@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -44,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,6 +59,8 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.uniomo.wafce.core.HttpStatusException
 import com.uniomo.wafce.core.LicenseRequiredException
@@ -70,6 +74,7 @@ import com.uniomo.wafce.ui.components.CardShape
 import com.uniomo.wafce.ui.components.EmptyBox
 import com.uniomo.wafce.ui.components.SectionCard
 import com.uniomo.wafce.ui.components.TagChip
+import com.uniomo.wafce.ui.components.rememberMsgHost
 import com.uniomo.wafce.ui.theme.Brand
 import com.uniomo.wafce.ui.theme.Danger
 import com.uniomo.wafce.ui.theme.InfoColor
@@ -110,6 +115,19 @@ data class IpGroupItem(
 
 data class PolicyItem(val id: Long, val name: String, val action: String, val raw: JsonObject)
 
+/**
+ * 专家 JSON 编辑器对应的目标接口。
+ *
+ * 早期版本靠弹窗标题字符串 `contains("防护")` 判断该下发到哪个接口，
+ * 文案一改就会把全局防护配置写到错误的接口。用枚举替代这种猜测。
+ */
+enum class RawKind(val title: String) {
+    MODE("防护模块"),
+    ACL("频率限制")
+}
+
+data class JsonEdit(val kind: RawKind, val json: String)
+
 /** 黑白名单规则：action 0=白名单（放行）1=黑名单（拦截） */
 data class RuleItem(
     val id: Long,
@@ -122,6 +140,16 @@ data class RuleItem(
 class ProtectVm : ViewModel() {
 
     var tab by mutableIntStateOf(0)
+
+    /**
+     * 请求代次自增标记。
+     *
+     * viewModel() 的作用域是 NavBackStackEntry，切换账号时本实例会被复用，
+     * 若不加校验，旧账号慢返回的响应会覆盖新账号的界面（甚至让人误删旧账号的资源）。
+     * 每次 loadAll 把 epoch 推进一代，请求回来时若代次已变就丢弃结果。
+     */
+    private var epoch = 0
+    private var loadJob: Job? = null
 
     var groups: UiState<List<IpGroupItem>> by mutableStateOf(UiState.Idle)
         private set
@@ -140,7 +168,11 @@ class ProtectVm : ViewModel() {
         private set
     var pendingGroupDelete by mutableStateOf<IpGroupItem?>(null)
         private set
-    var jsonEditor by mutableStateOf<Pair<String, String>?>(null) // title -> current json
+    var pendingRuleDelete by mutableStateOf<RuleItem?>(null)
+        private set
+    var pendingPolicyDelete by mutableStateOf<PolicyItem?>(null)
+        private set
+    var jsonEditor by mutableStateOf<JsonEdit?>(null) // 专家 JSON 编辑器
         private set
     var working by mutableStateOf(false)
         private set
@@ -158,25 +190,37 @@ class ProtectVm : ViewModel() {
     fun currentKey(): String = visibleTabs().getOrNull(tab)?.key ?: TAB_IPGROUP
 
     fun loadAll(account: AccountProfile) {
-        loadGroups(account)
-        loadRules(account)
-        loadPolicies(account)
-        loadMode(account)
-        loadAcl(account)
+        // 取消上一批在途请求并推进代次，避免切账号后旧响应串号。
+        // epoch 必须在协程外推进：loadAll 之后紧跟的单个 load*() 要能读到新值。
+        loadJob?.cancel()
+        val myEpoch = ++epoch
+        loadJob = viewModelScope.launch {
+            loadGroups(account, myEpoch)
+            loadRules(account, myEpoch)
+            loadPolicies(account, myEpoch)
+            loadMode(account, myEpoch)
+            loadAcl(account, myEpoch)
+        }
     }
 
     /**
      * 统一编排：404 → 登记为「该版本不支持」并隐藏页签；其它异常按普通错误处理。
+     *
+     * @param my 本次请求的代次；与当前 epoch 不一致说明账号已切换，结果直接丢弃。
      */
     private suspend fun <T> loadInto(
         key: String,
+        my: Int,
         assign: (UiState<T>) -> Unit,
         block: suspend () -> T
     ) {
         assign(UiState.Loading)
         try {
-            assign(UiState.Success(block()))
+            val data = block()
+            if (my != epoch) return
+            assign(UiState.Success(data))
         } catch (e: Exception) {
+            if (my != epoch) return
             if (isUnsupported(e)) {
                 if (key !in unsupported) unsupported = unsupported + key
             }
@@ -189,9 +233,9 @@ class ProtectVm : ViewModel() {
         e is LicenseRequiredException ||
             (e is HttpStatusException && e.httpCode == 404)
 
-    fun loadGroups(account: AccountProfile) {
+    fun loadGroups(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
-            loadInto(TAB_IPGROUP, { groups = it }) {
+            loadInto(TAB_IPGROUP, my, { groups = it }) {
                 val body = ApiClient.apiFor(account).ipGroups(mapOf("page" to "1", "page_size" to "100"))
                 val raw = Resp.obj(body)
                 Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map {
@@ -213,9 +257,9 @@ class ProtectVm : ViewModel() {
     }
 
     /** 黑白名单规则：action=0 视为白名单（放行），其余视为黑名单 */
-    fun loadRules(account: AccountProfile) {
+    fun loadRules(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
-            loadInto(TAB_RULE, { rules = it }) {
+            loadInto(TAB_RULE, my, { rules = it }) {
                 val body = ApiClient.apiFor(account).rules(mapOf("page" to "1", "page_size" to "100"))
                 val raw = Resp.obj(body)
                 Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map { o ->
@@ -247,9 +291,9 @@ class ProtectVm : ViewModel() {
         return n
     }
 
-    fun loadPolicies(account: AccountProfile) {
+    fun loadPolicies(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
-            loadInto(TAB_POLICY, { policies = it }) {
+            loadInto(TAB_POLICY, my, { policies = it }) {
                 val body = ApiClient.apiFor(account).policies(
                     mapOf("page" to "1", "page_size" to "100", "action" to "-1")
                 )
@@ -266,15 +310,15 @@ class ProtectVm : ViewModel() {
         }
     }
 
-    fun loadMode(account: AccountProfile) {
+    fun loadMode(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
-            loadInto(TAB_MODE, { modeRaw = it }) { Resp.obj(ApiClient.apiFor(account).globalMode()) }
+            loadInto(TAB_MODE, my, { modeRaw = it }) { Resp.obj(ApiClient.apiFor(account).globalMode()) }
         }
     }
 
-    fun loadAcl(account: AccountProfile) {
+    fun loadAcl(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
-            loadInto(TAB_ACL, { aclRaw = it }) { Resp.obj(ApiClient.apiFor(account).globalAcl()) }
+            loadInto(TAB_ACL, my, { aclRaw = it }) { Resp.obj(ApiClient.apiFor(account).globalAcl()) }
         }
     }
 
@@ -331,20 +375,24 @@ class ProtectVm : ViewModel() {
         }
     }
 
-    fun deletePolicy(account: AccountProfile, p: PolicyItem) {
+    fun requestDeletePolicy(p: PolicyItem) { pendingPolicyDelete = p }
+    fun cancelDeletePolicy() { pendingPolicyDelete = null }
+
+    fun confirmDeletePolicy(account: AccountProfile) {
+        val target = pendingPolicyDelete ?: return
         viewModelScope.launch {
+            working = true
             message = try {
-                ApiClient.apiFor(account).deletePolicy(p.id)
+                ApiClient.apiFor(account).deletePolicy(target.id)
                 loadPolicies(account)
-                "规则已删除"
+                "自定义规则已删除"
             } catch (e: Exception) {
                 e.readable()
             }
+            pendingPolicyDelete = null
+            working = false
         }
     }
-
-    var pendingRuleDelete by mutableStateOf<RuleItem?>(null)
-        private set
 
     fun requestDeleteRule(r: RuleItem) { pendingRuleDelete = r }
     fun cancelDeleteRule() { pendingRuleDelete = null }
@@ -367,16 +415,19 @@ class ProtectVm : ViewModel() {
 
     // ---------- 专家 JSON 编辑 ----------
 
-    fun openJsonEditor(title: String, json: String) { jsonEditor = title to json }
+    fun openJsonEditor(kind: RawKind, json: String) { jsonEditor = JsonEdit(kind, json) }
     fun closeJsonEditor() { jsonEditor = null }
 
-    fun saveJson(account: AccountProfile, kind: String, text: String) {
+    fun saveJson(account: AccountProfile, kind: RawKind, text: String) {
         viewModelScope.launch {
             working = true
             message = try {
                 val parsed = GsonBuilder().create().fromJson(text, JsonObject::class.java)
                 val api = ApiClient.apiFor(account)
-                if (kind == "mode") api.updateGlobalMode(parsed) else api.updateGlobalAcl(parsed)
+                when (kind) {
+                    RawKind.MODE -> api.updateGlobalMode(parsed)
+                    RawKind.ACL -> api.updateGlobalAcl(parsed)
+                }
                 loadMode(account); loadAcl(account)
                 closeJsonEditor()
                 "配置已下发"
@@ -405,27 +456,35 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
         onDispose { }
     }
 
-    // 从首页指标卡跳进来时直接落到目标页签。
-    // 注意要等 unsupported 判定完成后再定位，否则页签被隐藏会导致索引错位。
-    LaunchedEffect(initialTabKey, vm.unsupported) {
-        val key = initialTabKey ?: return@LaunchedEffect
-        val idx = vm.visibleTabs().indexOfFirst { it.key == key }
-        if (idx >= 0) vm.tab = idx
+    // 操作结果提示：必须挂在 snackbarHost 上。
+    // 早期版本把它写成 Scaffold 的兄弟节点，被 Scaffold 的不透明背景完全盖住，
+    // 导致所有写操作的失败原因用户一条都看不到。
+    val msgHost = rememberMsgHost()
+    LaunchedEffect(vm.message) {
+        val m = vm.message ?: return@LaunchedEffect
+        msgHost.show(m, long = true)
+        delay(2600)
+        vm.ack()
     }
 
-    vm.message?.let { msg ->
-        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
-            Text(msg, style = MaterialTheme.typography.bodySmall, color = Brand)
-        }
-        androidx.compose.runtime.LaunchedEffect(msg) {
-            kotlinx.coroutines.delay(2600)
-            vm.ack()
+    // 从首页指标卡跳进来时直接落到目标页签。
+    // 必须等 unsupported 判定完成后再定位，否则页签被隐藏会导致索引错位；
+    // 但只定位一次，否则某个请求晚到的 404 会把用户已选好的页签强行拉回。
+    var tabLocated by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(initialTabKey, vm.unsupported) {
+        val key = initialTabKey ?: return@LaunchedEffect
+        if (tabLocated) return@LaunchedEffect
+        val idx = vm.visibleTabs().indexOfFirst { it.key == key }
+        if (idx >= 0) {
+            vm.tab = idx
+            tabLocated = true
         }
     }
 
     Scaffold(
         // 外层 MainScaffold 已处理系统栏，这里清零避免重复叠加导致顶部留白
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        snackbarHost = { msgHost.Host() },
         floatingActionButton = {
             if (vm.currentKey() == TAB_IPGROUP) {
                 FloatingActionButton(onClick = { vm.openNewGroup() }) {
@@ -440,11 +499,13 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
                 EmptyBox("当前控制台版本未提供防护配置接口")
                 return@Scaffold
             }
-            if (vm.tab >= tabs.size) vm.tab = 0
-            TabRow(selectedTabIndex = vm.tab.coerceIn(0, tabs.lastIndex)) {
+            // 组合期间直接写 state 会触发本帧重组重跑，改用副作用一次收口
+            val safeTab = vm.tab.coerceIn(0, tabs.lastIndex)
+            LaunchedEffect(safeTab, tabs.size) { if (vm.tab != safeTab) vm.tab = safeTab }
+            TabRow(selectedTabIndex = safeTab) {
                 tabs.forEachIndexed { i, t ->
                     Tab(
-                        selected = vm.tab == i,
+                        selected = safeTab == i,
                         onClick = { vm.tab = i },
                         text = { Text(t.label, style = MaterialTheme.typography.labelLarge) }
                     )
@@ -458,13 +519,13 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
                     state = vm.modeRaw,
                     hint = "防护模块开关：语义分析、CC、人机验证、动态防护等模块的启用状态。修改后请谨慎下发。",
                     onReload = { vm.loadMode(account) },
-                    onEdit = { json -> vm.openJsonEditor("防护模块", json) }
+                    onEdit = { json -> vm.openJsonEditor(RawKind.MODE, json) }
                 )
                 TAB_ACL -> RawConfigTab(
                     state = vm.aclRaw,
                     hint = "频率限制（CC 防护）全局配置。编辑前建议先复制原始内容备份。",
                     onReload = { vm.loadAcl(account) },
-                    onEdit = { json -> vm.openJsonEditor("频率限制", json) }
+                    onEdit = { json -> vm.openJsonEditor(RawKind.ACL, json) }
                 )
             }
         }
@@ -486,7 +547,10 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
             title = { Text("删除 IP 组") },
             text = { Text("确定删除「${g.comment.ifBlank { "IP 组 ${g.id}" }}」？引用该组的规则可能失效。") },
             confirmButton = {
-                TextButton(onClick = { vm.confirmDeleteGroup(account) }) { Text("删除", color = Danger) }
+                TextButton(
+                    onClick = { vm.confirmDeleteGroup(account) },
+                    enabled = !vm.working
+                ) { Text("删除", color = Danger) }
             },
             dismissButton = { TextButton(onClick = { vm.cancelDeleteGroup() }) { Text("取消") } }
         )
@@ -498,19 +562,42 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
             title = { Text("删除${if (r.isWhite) "白" else "黑"}名单规则") },
             text = { Text("确定删除「${r.name}」？删除后该规则立即失效。") },
             confirmButton = {
-                TextButton(onClick = { vm.confirmDeleteRule(account) }) { Text("删除", color = Danger) }
+                TextButton(
+                    onClick = { vm.confirmDeleteRule(account) },
+                    enabled = !vm.working
+                ) { Text("删除", color = Danger) }
             },
             dismissButton = { TextButton(onClick = { vm.cancelDeleteRule() }) { Text("取消") } }
         )
     }
 
-    vm.jsonEditor?.let { (title, json) ->
+    vm.pendingPolicyDelete?.let { p ->
+        AlertDialog(
+            onDismissRequest = { vm.cancelDeletePolicy() },
+            title = { Text("删除自定义规则") },
+            text = {
+                Text(
+                    "确定删除「${p.name.ifBlank { "规则 ${p.id}" }}」？\n" +
+                        "该策略（${p.action}）删除后立即失效，且不可恢复。"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.confirmDeletePolicy(account) },
+                    enabled = !vm.working
+                ) { Text("删除", color = Danger) }
+            },
+            dismissButton = { TextButton(onClick = { vm.cancelDeletePolicy() }) { Text("取消") } }
+        )
+    }
+
+    vm.jsonEditor?.let { edit ->
         JsonEditorDialog(
-            title = title,
-            initial = json,
+            title = edit.kind.title,
+            initial = edit.json,
             working = vm.working,
             onDismiss = { vm.closeJsonEditor() },
-            onSave = { vm.saveJson(account, if (title.contains("防护")) "mode" else "acl", it) }
+            onSave = { vm.saveJson(account, edit.kind, it) }
         )
     }
 }
@@ -541,7 +628,7 @@ private fun GroupsTab(vm: ProtectVm, account: AccountProfile) {
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
                     item { Spacer(Modifier.height(2.dp)) }
-                    items(list, key = { it.id }) { g ->
+                    itemsIndexed(list, key = { i, it -> "${it.id}_$i" }) { _, g ->
                         Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
                             shape = CardShape,
@@ -692,7 +779,7 @@ private fun RulesTab(vm: ProtectVm, account: AccountProfile) {
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
                     item { Spacer(Modifier.height(2.dp)) }
-                    items(list, key = { it.id }) { r ->
+                    itemsIndexed(list, key = { i, it -> "${it.id}_$i" }) { _, r ->
                         Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
                             shape = CardShape,
@@ -746,58 +833,63 @@ private fun RulesTab(vm: ProtectVm, account: AccountProfile) {
 @Composable
 private fun PoliciesTab(vm: ProtectVm, account: AccountProfile) {
     AsyncBox(vm.policies, { vm.loadPolicies(account) }) { list ->
-        if (list.isEmpty()) EmptyBox("暂无自定义规则")
-        else LazyColumn(Modifier.fillMaxSize()) {
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    shape = CardShape,
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        // 统计卡放在 LazyColumn 外面：与GroupsTab / RulesTab 保持一致，
+        // 空列表时也保留汇总信息（否则「0 条规则」和「无数据」看起来一样）
+        Column(Modifier.fillMaxSize()) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = CardShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 14.dp, horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 14.dp, horizontal = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly
-                    ) {
-                        SummaryCell("规则总数", list.size.toString(), Brand, Modifier.weight(1f))
-                        SummaryCell("拦截", list.count { it.action == "拦截" }.toString(), Danger, Modifier.weight(1f))
-                        SummaryCell("放行", list.count { it.action == "放行" }.toString(), Ok, Modifier.weight(1f))
-                        SummaryCell("人机验证", list.count { it.action == "人机验证" }.toString(), Warn, Modifier.weight(1f))
-                    }
+                    SummaryCell("规则总数", list.size.toString(), Brand, Modifier.weight(1f))
+                    SummaryCell("拦截", list.count { it.action == "拦截" }.toString(), Danger, Modifier.weight(1f))
+                    SummaryCell("放行", list.count { it.action == "放行" }.toString(), Ok, Modifier.weight(1f))
+                    SummaryCell("人机验证", list.count { it.action == "人机验证" }.toString(), Warn, Modifier.weight(1f))
                 }
             }
-            items(list, key = { it.id }) { p ->
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
-                    shape = CardShape,
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-                ) {
-                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(p.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                            Spacer(Modifier.height(4.dp))
-                            Row {
-                                TagChip(text = "ID ${p.id}", color = Brand)
-                                Spacer(Modifier.size(6.dp))
-                                TagChip(
-                                    text = p.action,
-                                    color = when (p.action) {
-                                        "拦截" -> Danger
-                                        "放行" -> Ok
-                                        "人机验证" -> Warn
-                                        else -> InfoColor
+            if (list.isEmpty()) {
+                EmptyBox("暂无自定义规则")
+            } else {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    itemsIndexed(list, key = { i, it -> "${it.id}_$i" }) { _, p ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                            shape = CardShape,
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(p.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                    Spacer(Modifier.height(4.dp))
+                                    Row {
+                                        TagChip(text = "ID ${p.id}", color = Brand)
+                                        Spacer(Modifier.size(6.dp))
+                                        TagChip(
+                                            text = p.action,
+                                            color = when (p.action) {
+                                                "拦截" -> Danger
+                                                "放行" -> Ok
+                                                "人机验证" -> Warn
+                                                else -> InfoColor
+                                            }
+                                        )
                                     }
-                                )
+                                }
+                                IconButton(onClick = { vm.requestDeletePolicy(p) }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = Danger, modifier = Modifier.size(18.dp))
+                                }
                             }
                         }
-                        IconButton(onClick = { vm.deletePolicy(account, p) }) {
-                            Icon(Icons.Default.Delete, contentDescription = "删除", tint = Danger, modifier = Modifier.size(18.dp))
-                        }
                     }
+                    item { Spacer(Modifier.height(80.dp)) }
                 }
             }
-            item { Spacer(Modifier.height(80.dp)) }
         }
     }
 }
@@ -810,6 +902,14 @@ private fun RawConfigTab(
     onEdit: (String) -> Unit
 ) {
     AsyncBox(state, onReload) { raw ->
+        // Resp.obj 在 data 为 null 时返回空 JsonObject，此时不渲染「{}」卡片，
+        // 否则用户看到的是一份看起来有效、实则什么都没返回的配置
+        if (raw.size() == 0) {
+            EmptyBox("服务端未返回该配置内容")
+            return@AsyncBox
+        }
+        // pretty 只生成一次，避免「看到的」与「下发的」序列化结果可能不同
+        val pretty = remember(raw) { GsonBuilder().setPrettyPrinting().create().toJson(raw) }
         Column(
             Modifier
                 .fillMaxSize()
@@ -817,13 +917,12 @@ private fun RawConfigTab(
                 .padding(bottom = 32.dp)
         ) {
             SectionCard("当前配置", subtitle = hint, actions = {
-                TextButton(onClick = { onEdit(GsonBuilder().setPrettyPrinting().create().toJson(raw)) }) {
+                TextButton(onClick = { onEdit(pretty) }) {
                     Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.size(4.dp))
                     Text("编辑")
                 }
             }) {
-                val pretty = remember(raw) { GsonBuilder().setPrettyPrinting().create().toJson(raw) }
                 Text(
                     pretty,
                     style = MaterialTheme.typography.labelSmall,
@@ -842,8 +941,10 @@ private fun IpGroupDialog(
     onDismiss: () -> Unit,
     onSave: (comment: String, ips: String) -> Unit
 ) {
-    var comment by remember { mutableStateOf(item.comment) }
-    var ips by remember { mutableStateOf(item.ips.joinToString("\n")) }
+    // rememberSaveable：弹窗的存在状态在 ViewModel 里，旋转屏幕后弹窗会重建，
+    // 用 remember 的话用户刚输入的 IP 列表和备注会全部清空
+    var comment by rememberSaveable(item.id) { mutableStateOf(item.comment) }
+    var ips by rememberSaveable(item.id) { mutableStateOf(item.ips.joinToString("\n")) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -882,7 +983,9 @@ private fun JsonEditorDialog(
     onDismiss: () -> Unit,
     onSave: (String) -> Unit
 ) {
-    var text by remember { mutableStateOf(initial) }
+    // rememberSaveable：弹窗存在状态在 ViewModel 里，旋转后弹窗会重建，
+    // 用 remember 会让用户粘贴的整段 JSON 消失
+    var text by rememberSaveable { mutableStateOf(initial) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("编辑：$title") },

@@ -219,12 +219,12 @@ def _render(t=0.0, blink=False, look=0.0, mouth=0.0, wave=0.0):
     for sx in (-1, 1):
         sh = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
         ImageDraw.Draw(sh).ellipse(
-            [hx + sx * r * 0.58 - r * 0.34, hy - ry * 0.10,
-             hx + sx * r * 0.58 + r * 0.34, hy + ry * 0.80], fill=SKIN_S + (85,))
+            [hx + sx * r * 0.66 - r * 0.26, hy + ry * 0.06,
+             hx + sx * r * 0.66 + r * 0.26, hy + ry * 0.72], fill=SKIN_S + (55,))
         img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(16)))
         d = ImageDraw.Draw(img)
     d.ellipse([hx - r * 0.32, hy + ry * 0.84, hx + r * 0.32, hy + ry * 1.20],
-              fill=SKIN_D + (120,))
+              fill=SKIN_D + (95,))
 
     # ---------- 4. 前发 ----------
     fh = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
@@ -256,7 +256,7 @@ def _render(t=0.0, blink=False, look=0.0, mouth=0.0, wave=0.0):
         byy = hy + ry * 0.48
         bh = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
         ImageDraw.Draw(bh).ellipse([bx - r * 0.21, byy - r * 0.12,
-                                    bx + r * 0.21, byy + r * 0.12], fill=BLUSH + (115,))
+                                    bx + r * 0.21, byy + r * 0.12], fill=BLUSH + (95,))
         img.alpha_composite(bh.filter(ImageFilter.GaussianBlur(8)))
         d = ImageDraw.Draw(img)
         for k in (-1, 0, 1):

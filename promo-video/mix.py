@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""成片音频合成：人声 + 配乐 + 侧链闪避 + 统一响度
+"""成片音频合成：人声 + 配乐 + 侧链闪避 + 母带
 
 流程：
   1. 按时间轴把每条解说放到对应位置，得到一条完整旁白轨
-  2. 用旁白的包络驱动配乐做 ducking（人声开口，伴奏自动下沉 8~10dB）
-  3. 混音 -> 轻压缩 -> loudnorm 统一到 -16 LUFS（网络视频通用）
+  2. 人声链：高通去隆隆 → 宽带压缩贴耳 → 去齿音 → 3.2k 提清晰度
+  3. 用旁白包络驱动配乐做 ducking（人声开口，伴奏平滑下沉 6.5dB）
+  4. 混音 → 母线轻压缩 → 峰值限制 → loudnorm 统一到 -16 LUFS
 """
 import numpy as np
 import os, subprocess, sys, json, wave
-from dsp import SR, to_sr, place, normalize, dither, fade, lowpass
+
+from dsp import (SR, to_sr, place, normalize, dither, lowpass, highpass, peak_eq,
+                 compress, deesser, rms_env, smooth_env, sidechain_gain)
 
 TARGET_LUFS = -16.0
 TP = -1.5
@@ -37,28 +40,7 @@ def _resample(x, sr_in, sr_out=SR):
     return np.interp(xp, np.arange(len(x)), x).astype(np.float32)
 
 
-def speech_rms(path, sr=SR, win=0.025, hop=0.010):
-    """返回 (包络, sr)，用于驱动 ducking"""
-    x, srin = _read_wav_mono(path)
-    x = _resample(x, srin, sr)
-    w, h = to_sr(win, sr), to_sr(hop, sr)
-    n = max(1, (len(x) - w) // h)
-    env = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        seg = x[i * h: i * h + w]
-        env[i] = float(np.sqrt((seg ** 2).mean()))
-    # 5 点平滑，去掉音节间的小坑
-    k = np.ones(5, dtype=np.float32) / 5
-    env = np.convolve(env, k, mode="same")
-    # 归一化后做「软」拐点，避免一开口就全沉
-    m = float(np.percentile(env, 97)) or 1.0
-    env = np.clip(env / m, 0, 1.4)
-    env = np.clip((env - 0.06) / 0.55, 0, 1)
-    return env, h
-
-
 def vocal_track(timeline, n_smp):
-    """timeline: [(wav_path, start_sec)] -> 完整旁白轨"""
     buf = np.zeros(n_smp, dtype=np.float32)
     for path, t in timeline:
         x, srin = _read_wav_mono(path)
@@ -67,42 +49,38 @@ def vocal_track(timeline, n_smp):
     return buf
 
 
-def duck_gain(vocal_env, hop, n_smp, depth_db=9.0, smooth_db=1.5):
-    """由人声包络生成配乐增益曲线（1.0 = 不动，越小越沉）"""
-    depth = 10 ** (-depth_db / 20.0)
-    g = 1.0 - (1.0 - depth) * vocal_env
-    # 扩展回采样点
-    idx = np.arange(len(g)) * hop
-    gs = np.interp(np.arange(n_smp), idx, g)
-    # 让增益变化慢一点，听不出「抽气」
-    k = to_sr(0.28)
-    kern = np.ones(k, dtype=np.float32) / k
-    gs = np.convolve(gs, kern, mode="same")
-    return gs.astype(np.float32)
+def voice_chain(x):
+    """人声处理链：只在人声轨上做，别去动配乐"""
+    x = highpass(x, 85, 2)                     # 去隆隆
+    x, _ = compress(x, thr=0.09, ratio=3.2, attack=0.006, release=0.16, makeup=1.9)
+    x = deesser(x)                             # 齿音
+    x = peak_eq(x, 3200, 1.1, 2.0)             # 清晰度
+    x = peak_eq(x, 240, 1.2, -1.5)             # 去箱声
+    x = highpass(x, 100, 1)
+    return normalize(x, 0.86)
+
+
+def speech_rms_from_signal(x, win=0.025, hop=0.010, sr=SR):
+    e, h = rms_env(np.abs(x), win, sr, hop)
+    m = float(np.percentile(e, 97)) or 1.0
+    e = np.clip(e / m, 0, 1.4)
+    e = np.clip((e - 0.05) / 0.5, 0, 1)
+    return e, h
+
+
+def duck_gain(vocal_env, hop, n_smp, depth_db=6.5, smooth_db=1.5):
+    return sidechain_gain(vocal_env, hop, n_smp, depth_db=depth_db, atk=0.006, rel=0.40)
 
 
 def _to_stereo(x):
     return np.stack([x, x], axis=1)
 
 
-def build_mix(narration_json, bgm_path, out_wav, total_sec,
-              vocal_gain=1.0, bgm_gain=1.0, duck_db=9.0):
-    n_smp = to_sr(total_sec + 0.5)
-
-    # --- 旁白时间轴 ---
-    # narration.json: {key: {wav, dur, gap, at}}；at 是相对本场景起点的偏移
-    # 场景起点由 durations/scene 时间轴给出；这里由调用方传入已算好的绝对时间
-    raise SystemExit("use build_mix_timeline instead")
-
-
 def build_mix_timeline(timeline, bgm_path, out_wav, total_sec,
-                       vocal_gain=1.0, bgm_gain=1.0, duck_db=9.0):
-    """timeline: [(wav_path, start_sec), ...]"""
-    n_smp = to_sr(total_sec + 0.6)
+                       vocal_gain=1.0, bgm_gain=1.0, duck_db=6.5):
+    n_smp = to_sr(total_sec + 0.8)
     voc = vocal_track(timeline, n_smp)
-
-    # 旁白：高通 + 轻微压缩，贴住「近讲」感
-    voc = _deess(voc)
+    voc = voice_chain(voc)
 
     env, hop = speech_rms_from_signal(voc)
     gain = duck_gain(env, hop, n_smp, depth_db=duck_db)
@@ -112,51 +90,19 @@ def build_mix_timeline(timeline, bgm_path, out_wav, total_sec,
         bg = _resample(bg, srb, SR)
     bg = np.pad(bg, (0, max(0, n_smp - len(bg))))[:n_smp]
 
-    # 配乐整体再切掉 200Hz 以下一点点，把低频让给贝斯与人声基频
-    bg_mix = bg * gain
+    # 配乐让低频给人声基频；侧链闪避
+    bg_mix = highpass(bg, 45, 1) * gain
+    bg_mix, _ = compress(bg_mix, thr=0.30, ratio=2.0, attack=0.02, release=0.30, makeup=1.25)
 
     voc_st = _to_stereo(voc * vocal_gain)
     bg_st = np.stack([bg_mix, bg_mix], axis=1) * bgm_gain
-
     mix = voc_st + bg_st
-    mix = _limit(mix, 0.985)
+    mix = _limit(mix, 0.965)
     write_wav_float(out_wav, mix)
     return out_wav
 
 
-def _deess(x):
-    """极简去齿音：只在 6~10k 做动态衰减"""
-    from scipy.signal import lfilter, butter
-    b, a = butter(2, [6000 / (SR / 2), 10000 / (SR / 2)], btype="band")
-    hi = lfilter(b, a, x).astype(np.float32)
-    # 高频包络
-    n = len(hi)
-    env = np.abs(hi)
-    k = to_sr(0.004)
-    kern = np.ones(k, dtype=np.float32) / k
-    e = np.convolve(env, kern, mode="same")
-    thr = np.percentile(e, 96) * 0.85 + 1e-6
-    red = np.clip(thr / (e + 1e-6), 0.35, 1.0).astype(np.float32)
-    return (x - hi + hi * red).astype(np.float32)
-
-
-def speech_rms_from_signal(x, sr=SR, win=0.025, hop=0.010):
-    w, h = to_sr(win, sr), to_sr(hop, sr)
-    n = max(1, (len(x) - w) // h)
-    env = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        seg = x[i * h: i * h + w]
-        env[i] = float(np.sqrt((seg ** 2).mean()))
-    k = np.ones(5, dtype=np.float32) / 5
-    env = np.convolve(env, k, mode="same")
-    m = float(np.percentile(env, 97)) or 1.0
-    env = np.clip(env / m, 0, 1.4)
-    env = np.clip((env - 0.05) / 0.5, 0, 1)
-    return env, h
-
-
 def _limit(x, ceiling=0.985):
-    """软限幅：超过 ceiling 的部分用 tanh 折回来，比硬切干净"""
     m = np.max(np.abs(x)) or 1.0
     if m <= ceiling:
         return x.astype(np.float32)

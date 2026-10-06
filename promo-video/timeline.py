@@ -70,5 +70,6 @@ if __name__ == "__main__":
             k, s["start"], s["dur"], s["voice"],
             "%.2f" % s["voice_at"] if s["voice_at"] else "-"))
     print("---\n总时长 %.2fs = %d:%02d" % (total, total // 60, total % 60))
-    json.dump(dict(scenes=scenes, total=total),
-              open("/tmp/work/.video/timeline.json", "w"), ensure_ascii=False, indent=1)
+    outp = os.path.join(os.path.dirname(os.path.abspath(d)), "timeline.json")
+    json.dump(dict(scenes=scenes, total=total), open(outp, "w"),
+              ensure_ascii=False, indent=1)

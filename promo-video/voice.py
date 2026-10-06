@@ -6,14 +6,14 @@
 """
 import asyncio, os, subprocess, json, shutil
 
-VOICE = "zh-CN-XiaoyiNeural"     # 卡通/小说风格女声，二次元介绍片常用
-RATE  = "+8%"                     # 稍快，贴合 3~4 分钟节奏
-PITCH = "+25Hz"                   # 抬一点音调，更贴 Q 版角色
+VOICE = "zh-CN-XiaoxiaoNeural"  # 温柔女声；v4 换掉 Xiaoyi（实测 6kHz 以上能量 27%，沙沙地刺耳）
+RATE  = "-4%"                     # 放慢一点，娓娓道来；v3 的 +8% 又急又尖
+PITCH = "-2Hz"                    # 不再抬调；v3 的 +25Hz 把共振峰整体上移，是「刺」的来源之一
 
 # ---------- 解说词 ----------
 # id: 句子标识；text: 文案；gap: 句后停顿(秒)
 NARRATION = {
-    "hook": dict(text="每天晚上，你的服务器都在被扫描。", gap=0.35, at=0.8),
+    "hook": dict(text="每天晚上，你的服务器都在被扫描。", gap=0.4, at=0.8),
     "intro": dict(
         text="我叫雷小池，是你的安全小助手。今天要介绍的，是雷池 WAF 社区版的原生安卓客户端。",
         gap=0.4, at=0.6),
@@ -68,7 +68,7 @@ NARRATION = {
         gap=0.4, at=0.8),
     "end": dict(
         text="雷池 WAF 客户端。为你的防线，站好每一班岗。",
-        gap=0.5, at=1.0),
+        gap=0.6, at=1.2),
 }
 
 
@@ -88,7 +88,7 @@ async def _synth_one(key, item, outdir):
     wav = os.path.join(outdir, f"{key}.wav")
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-i", mp3,
-         "-af", "highpass=f=95,afftdn=nf=-25,acompressor=threshold=-16dB:ratio=2.6:attack=6:release=160",
+         "-af", "highpass=f=95,afftdn=nf=-28,equalizer=f=2800:t=q:w=1.2:g=-2,equalizer=f=7000:t=h:w=2000:g=-3,deesser,acompressor=threshold=-16dB:ratio=2.4:attack=8:release=180,alimiter=limit=0.95",
          "-ar", "48000", "-ac", "1", wav], check=True)
     return key, wav, _ffprobe_dur(wav)
 

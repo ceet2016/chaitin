@@ -70,6 +70,39 @@ def piano(freq, dur=1.6, amp=0.3, bright=1.0, detune=0.0):
     return _ens(out * amp, n, 0.0018, min(0.35, dur * 0.35)).astype(np.float32)
 
 
+# ---------- Rhodes 电钢（温暖、软起音）----------
+# 与三角钢琴的区别：分音更少、高次分音砍掉、起音是「鼓包」而不是「锤击」，
+# 再加一点颤音（tine 的典型特征），整体落在中低音区，作为铺底不抢耳。
+_RHODES_SPEC = [
+    (1.000, 1.00, 1.30, 0.0000),
+    (2.003, 0.34, 2.10, 0.0007),
+    (3.008, 0.13, 3.40, -0.0011),
+    (4.014, 0.055, 5.20, 0.0014),
+]
+
+
+def rhodes(freq, dur=2.0, amp=0.18, trem=0.0):
+    n = to_sr(dur)
+    t = np.arange(n, dtype=np.float32) / SR
+    out = np.zeros(n, dtype=np.float32)
+    for ratio, a, dec, det in _RHODES_SPEC:
+        f = freq * ratio * (1 + det)
+        if f >= SR * 0.45:
+            continue
+        out += a * np.sin(2 * np.pi * f * t + _rng.uniform(0, 6.28)) * np.exp(-dec * t)
+    # tine 颤音：电钢那种轻微的「嗡」，很轻
+    out += 0.10 * np.sin(2 * np.pi * freq * 2.003 * 1.0015 * t) * np.exp(-1.4 * t)
+    # 软起音（30ms 鼓包）而不是钢琴的 7ms 锤击，这是「棉」的来源
+    atk = to_sr(0.030)
+    env = np.ones(n, dtype=np.float32)
+    env[:atk] = np.linspace(0, 1, atk, dtype=np.float32) ** 1.6
+    out *= env
+    out = highpass(out, 55)
+    out = lowpass(out, 3400, 2)
+    out = tape_sat(out, 1.3, 0.28)
+    return _ens(out * amp, n, 0.004, min(0.5, dur * 0.4)).astype(np.float32)
+
+
 # ---------- 弦乐群 ----------
 _STR_SPEC = [
     (1.000, 1.00, 0.075),
@@ -228,7 +261,7 @@ def snare(dur=0.32, amp=0.16, ghost=False):
     t = np.arange(n, dtype=np.float32) / SR
     tone = (np.sin(2 * np.pi * 186 * t) * 0.5 + np.sin(2 * np.pi * 278 * t) * 0.3) \
         * np.exp(-t * 28)
-    rattle = bandpass(_noise(n), 1400, 8200, 3) * np.exp(-t * (70 if ghost else 34))
+    rattle = bandpass(_noise(n), 1200, 6500, 3) * np.exp(-t * (70 if ghost else 34))
     out = tone * 0.5 + rattle * (0.35 if ghost else 1.0)
     return _ens(out * amp, n, 0.001, 0.05).astype(np.float32)
 
@@ -236,7 +269,7 @@ def snare(dur=0.32, amp=0.16, ghost=False):
 def hat(dur=0.1, amp=0.06, open_=False):
     n = to_sr(dur if not open_ else max(dur, 0.5))
     t = np.arange(n, dtype=np.float32) / SR
-    nz = bandpass(_noise(n), 7000, 15000, 3)
+    nz = bandpass(_noise(n), 5000, 11000, 2)
     return (nz * np.exp(-t * (48 if not open_ else 7.5)) * amp).astype(np.float32)
 
 
@@ -245,14 +278,14 @@ def shaker(dur=0.13, amp=0.045):
     n = to_sr(dur)
     t = np.arange(n, dtype=np.float32) / SR
     env = np.exp(-t * 26) * (1 + 0.6 * np.exp(-t * 90))
-    nz = bandpass(_noise(n), 3800, 12000) * env
+    nz = bandpass(_noise(n), 3000, 9000) * env
     return (nz * amp).astype(np.float32)
 
 
 def shaker16(dur=0.07, amp=0.03):
     n = to_sr(dur)
     t = np.arange(n, dtype=np.float32) / SR
-    nz = bandpass(_noise(n), 5200, 15000) * np.exp(-t * 55)
+    nz = bandpass(_noise(n), 4200, 11000) * np.exp(-t * 55)
     return (nz * amp).astype(np.float32)
 
 
@@ -260,11 +293,11 @@ def cymbal_swell(dur=2.6, amp=0.1):
     """镲片渐强：段落切换处的「呼气」，不是老的扫频 riser"""
     n = to_sr(dur)
     t = np.arange(n, dtype=np.float32) / SR
-    nz = bandpass(_noise(n), 3000, 14000, 2)
+    nz = bandpass(_noise(n), 2200, 9000, 2)
     env = (t / dur) ** 2.6
-    # 叠一点点高频正弦，避免纯噪声听起来像吹气
-    tone = np.sin(2 * np.pi * np.cumsum(np.linspace(2600, 6200, n)) / SR) * 0.12
-    return (lowpass(nz, 15000) * env * amp + tone * env * amp).astype(np.float32)
+    # 叠一点中频正弦，避免纯噪声听起来像吹气
+    tone = np.sin(2 * np.pi * np.cumsum(np.linspace(2200, 4200, n)) / SR) * 0.10
+    return (lowpass(nz, 9000) * env * amp + lowpass(tone, 6000) * env * amp * 0.8).astype(np.float32)
 
 
 def rim(dur=0.12, amp=0.1):

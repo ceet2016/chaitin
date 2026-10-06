@@ -14,6 +14,23 @@ SUBS = {}
 FRAMES_DIR = os.environ.get("VIDEO_FRAMES", "/workspace/.video/frames")
 SHOT_DIR = os.environ.get("VIDEO_SHOTS", "/workspace/docs")
 
+
+def sync_durations_from_timeline():
+    """把 storyboard 里写死的各幕时长，同步成 timeline.json 算出来的时长。
+
+    storyboard.py 里的 dur 是「初稿估值」，真正决定画面长度的是由旁白长度
+    推算出的 timeline。两者一旦不同步，画面就会和旁白 / 配乐错位，
+    所以渲染前统一以 timeline 为准。"""
+    tj = os.path.join(os.path.dirname(FRAMES_DIR), "timeline.json")
+    if not os.path.exists(tj):
+        return
+    scenes = json.load(open(tj))["scenes"]
+    for sc in SCENES:
+        s = scenes.get(sc["id"])
+        if s and abs(s["dur"] - sc["dur"]) > 1e-6:
+            sc["dur"] = s["dur"]
+
+
 def load_subs(path=None):
     path = path or os.path.join(os.path.dirname(FRAMES_DIR), "subtitles.json")
     global SUBS
@@ -115,14 +132,20 @@ def s_chara_talk(base, t, d):
     mouth = 0.7 if (int(t*3)%2==0 and t%0.5<0.3) else 0.2
     character.draw_character(base, chara_x, H*0.46, 1.55, t, blink,
                              math.sin(t*0.7)*0.4, mouth, wave=0.6*max(0,math.sin(t*0.5)))
-    # 对话气泡
+    # 对话气泡：文案以「当前字幕」为唯一来源（storyboard.lines 只作兜底），
+    # 避免气泡里的旧稿与底部字幕的新旁白两套文本打架。
     lines = d.get("lines", [])
     title = d.get("title")
     shown = None; lp = 0
-    for (start, txt) in lines:
-        if t >= start:
-            shown = txt
-            lp = clamp01((t-start)/0.5)
+    cur_sub = subtitles.active(SUBS.get(d["id"]) or [], t)
+    if cur_sub:
+        shown = cur_sub
+        lp = 1.0
+    else:
+        for (start, txt) in lines:
+            if t >= start:
+                shown = txt
+                lp = clamp01((t-start)/0.5)
     if title and t>0:
         ui.title_text(base, W*0.66, H*0.22, title, fs=64, color=BLUE_BRAND,
                       stroke=2, stroke_color=(255,255,255))
@@ -309,7 +332,8 @@ def _worker(args):
         part.draw(frame, 1/FPS)
         sc_subs = SUBS.get(sc["id"]) or []
         txt = subtitles.active(sc_subs, t)
-        if txt:
+        # chara_talk 场景用气泡承载文案，底部不再重复画一条字幕
+        if txt and sc["kind"] != "chara_talk":
             subtitle_draw.draw(frame, txt)
         frame.convert("RGB").save(f"{outdir}/{f:05d}.jpg", quality=92)
     return si, nf
@@ -320,6 +344,7 @@ def render_all(outdir=None):
     FRAMES_DIR = outdir
     import time, multiprocessing as mp
     os.makedirs(outdir, exist_ok=True)
+    sync_durations_from_timeline()
     load_shots()
     load_subs()
     t0 = time.time()

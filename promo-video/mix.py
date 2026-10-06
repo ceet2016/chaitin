@@ -54,7 +54,7 @@ def voice_chain(x):
     x = highpass(x, 85, 2)                     # 去隆隆
     x, _ = compress(x, thr=0.09, ratio=3.2, attack=0.006, release=0.16, makeup=1.9)
     x = deesser(x)                             # 齿音
-    x = peak_eq(x, 3200, 1.1, 2.0)             # 清晰度
+    x = peak_eq(x, 3200, 1.1, 1.2)             # 清晰度（v3 的 2.0dB 偏冲，收回一点）
     x = peak_eq(x, 240, 1.2, -1.5)             # 去箱声
     x = highpass(x, 100, 1)
     return normalize(x, 0.86)
@@ -77,7 +77,7 @@ def _to_stereo(x):
 
 
 def build_mix_timeline(timeline, bgm_path, out_wav, total_sec,
-                       vocal_gain=1.0, bgm_gain=1.0, duck_db=6.5):
+                       vocal_gain=1.0, bgm_gain=1.0, duck_db=5.5):
     n_smp = to_sr(total_sec + 0.8)
     voc = vocal_track(timeline, n_smp)
     voc = voice_chain(voc)
@@ -92,6 +92,7 @@ def build_mix_timeline(timeline, bgm_path, out_wav, total_sec,
 
     # 配乐让低频给人声基频；侧链闪避
     bg_mix = highpass(bg, 45, 1) * gain
+    bg_mix = peak_eq(bg_mix, 2800, 1.0, -1.5)   # 再压一点刺耳区
     bg_mix, _ = compress(bg_mix, thr=0.30, ratio=2.0, attack=0.02, release=0.30, makeup=1.25)
 
     voc_st = _to_stereo(voc * vocal_gain)

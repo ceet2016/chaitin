@@ -6,11 +6,22 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from theme import *
 import character, bgfx, ui
 from storyboard import SCENES
+import subtitle_draw, subtitles
+import json
 
 SHOTS = {}
+SUBS = {}
+FRAMES_DIR = os.environ.get("VIDEO_FRAMES", "/workspace/.video/frames")
+SHOT_DIR = os.environ.get("VIDEO_SHOTS", "/workspace/docs")
+
+def load_subs(path=None):
+    path = path or os.path.join(os.path.dirname(FRAMES_DIR), "subtitles.json")
+    global SUBS
+    if os.path.exists(path):
+        SUBS = json.load(open(path))
 def load_shots():
     for name in ("accounts","login","dashboard"):
-        p = f"/workspace/docs/screenshot-{name}.jpg"
+        p = os.path.join(SHOT_DIR, f"screenshot-{name}.jpg")
         if os.path.exists(p):
             SHOTS[name] = Image.open(p).convert("RGB")
 
@@ -285,7 +296,7 @@ def _worker(args):
     pcolor = (205,215,255) if sc["id"]=="hook" else (255,196,220)
     part = bgfx.Particles((W,H), n=30, seed=si*7+3, kind="petal", color=pcolor)
     renderer = RENDERERS[sc["kind"]]
-    outdir = f"/workspace/.video/frames/s{si:02d}"
+    outdir = os.path.join(FRAMES_DIR, f"s{si:02d}")
     os.makedirs(outdir, exist_ok=True)
     for f in range(nf):
         t = f/FPS
@@ -296,13 +307,21 @@ def _worker(args):
             ImageDraw.Draw(frame).text((W/2,H/2), f"ERR {sc['id']}: {e}",
                                        font=font(40), fill=(255,0,0), anchor="mm")
         part.draw(frame, 1/FPS)
+        sc_subs = SUBS.get(sc["id"]) or []
+        txt = subtitles.active(sc_subs, t)
+        if txt:
+            subtitle_draw.draw(frame, txt)
         frame.convert("RGB").save(f"{outdir}/{f:05d}.jpg", quality=92)
     return si, nf
 
-def render_all(outdir="/workspace/.video/frames"):
+def render_all(outdir=None):
+    global FRAMES_DIR
+    outdir = outdir or FRAMES_DIR
+    FRAMES_DIR = outdir
     import time, multiprocessing as mp
     os.makedirs(outdir, exist_ok=True)
     load_shots()
+    load_subs()
     t0 = time.time()
     jobs = list(enumerate(SCENES))
     with mp.Pool(8) as pool:
@@ -319,5 +338,6 @@ if __name__ == "__main__":
         nf = int(round(sc["dur"]*FPS))
         meta.append(dict(id=sc["id"], si=si, n=nf, dur=sc["dur"]))
         idx += nf
-    json.dump(meta, open("/workspace/.video/frames/meta.json","w"), ensure_ascii=False, indent=1)
+    json.dump(meta, open(os.path.join(FRAMES_DIR, "meta.json"),"w"),
+              ensure_ascii=False, indent=1)
     print("TOTAL", idx, idx/FPS, "s")

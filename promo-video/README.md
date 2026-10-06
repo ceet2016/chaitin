@@ -1,15 +1,50 @@
 # 二次元风格中文介绍视频
 
-为「雷池 WAF 社区版 · Android 客户端」制作的 3 分 28 秒二次元风格中文介绍片。
-全部画面由 Python(Pillow) 逐帧程序化绘制，配乐由 Python(numpy) 程序化合成，
-无需任何外部素材或素材授权。
+为「雷池 WAF 社区版 · Android 客户端」制作的 3 分 17 秒二次元风格中文介绍片。
+画面由 Python(Pillow) 逐帧程序化绘制，配乐由 Python(numpy+scipy) 程序化合成，
+中文讲解由 Edge-TTS 生成，无需任何外部素材或素材授权。
 
 ## 成片
 
 - 分辨率：1920×1080 @ 30fps
-- 时长：208.4 秒（3:28）
-- 编码：H.264(OpenH264) + AAC 立体声
+- 时长：196.7 秒（3:17）
+- 编码：H.264(OpenH264) + AAC 立体声 48kHz
+- 响度：-16 LUFS / 真峰 -4 dBTP（网络视频通用）
 - 文件：`safeline_intro.mp4`
+
+## 音频设计（v2 重做）
+
+v1 的配乐听起来像电子琴，原因是**所有音都是纯正弦叠加**：
+频谱上是一条条笔直无衰减的横线，没有起音噪声、没有非谐分音、
+没有空间感，而且是「4 和弦 × 2 秒」死循环重复 26 遍，全程 RMS 恒定 0.10。
+v2 从四方面重做：
+
+1. **音色**：每个音都带「敲击噪声 + 非谐分音 + 逐分音衰减 + 软饱和」，
+   频谱自然长开（新增 `dsp.py` / `instruments.py`）。
+2. **编曲**：改成 7 段式结构，配器/力度/密度随段落变化，鼓点做了两段式音高包络，
+   不再是「节拍器」感。
+3. **空间**：卷积混响 + 中侧处理，伴奏推向两侧，把人声位置让出来。
+4. **人声**：Edge-TTS 中文女声（`zh-CN-XiaoyiNeural`，+8% 语速 / +25Hz 音调），
+   并按解说包络对配乐做 **9dB 侧链闪避**，开口时伴奏自动下沉。
+
+## 分镜（12 幕）
+
+| # | 场景 | 时长 | 内容 |
+|---|------|-----|------|
+| 1 | open | 9.2s | 片头：盾牌徽记 + 标题 |
+| 2 | hook | 5.8s | 悬念：服务器每晚都在被扫描 |
+| 3 | intro | 10.1s | 角色「雷小池」登场自我介绍 |
+| 4 | what | 17.2s | 它是什么：原生安卓管理端 |
+| 5 | feat1 | 24.6s | 多实例 / 一键切换（附真实截图） |
+| 6 | feat2 | 25.3s | 仪表盘 / 安全态势（附真实截图） |
+| 7 | feat3 | 21.8s | 两种接入方式（附真实截图） |
+| 8 | mods | 19.0s | 防护模块九宫格 |
+| 9 | log | 27.9s | 日志中心：结构化详情 |
+| 10 | safe | 16.6s | 安全设计：Keystore 加密 |
+| 11 | dl | 11.8s | 下载指引 |
+| 12 | end | 7.4s | 片尾：角色 + 仓库地址 |
+
+> 每幕时长由旁白长度自动推算（`timeline.py`），改文案不用手调时间轴。
 
 ## 分镜（12 幕）
 
@@ -31,16 +66,25 @@
 ## 生产流程
 
 ```bash
-pip install pillow numpy
-# 1. 渲染全部帧（多进程，约 5 分钟）
-python render.py            # 输出到 frames/s{场景号}/{帧号}.jpg + meta.json
-# 2. 合成 BGM
-python bgm.py 208.4         # 输出 audio/bgm.wav
-# 3. 编码各场景片段
-#    ffmpeg -framerate 30 -i frames/s00/%05d.jpg -c:v libopenh264 ...
-# 4. xfade 转场拼接 + 混音
-#    ffmpeg ... -filter_complex "[0:v][1:v]xfade=..." out/safeline_intro.mp4
+pip install pillow numpy scipy edge-tts
+./build.sh                  # 一键：配音 -> 分镜 -> 配乐 -> 画面 -> 混流
 ```
+
+分步说明：
+
+```bash
+python voice.py   .video/narration   # 1. 合成 11 句中文旁白（断点续跑）
+python timeline.py .video/narration  # 2. 由旁白长度算各幕时长
+python subtitles.py .video/narration # 3. 切字幕条（不切断西文单词）
+python bgm.py 196.7 .video/audio/bgm.wav   # 4. 合成配乐
+python render.py                     # 5. 逐帧渲染（多进程，约 6 分钟）
+python mixrun.py .video              # 6. 侧链闪避 + 混音 + loudnorm
+python encode.py --frames .video/frames --meta .video/frames/meta.json \
+    --audio .video/audio/mix.wav --out .video/out/safeline_intro.mp4
+```
+
+> 拼接**刻意不用 xfade**：转场会吃掉时长（每幕 0.6s），画面会比旁白越错越多。
+> 每幕自带缓入缓出，硬切已经足够顺，`encode.py` 里还有时长自检。
 
 ## 模块
 
@@ -52,10 +96,21 @@ python bgm.py 208.4         # 输出 audio/bgm.wav
 | `ui.py` | 伪 UI 组件：手机壳、指标卡、徽章、标题 |
 | `storyboard.py` | 12 幕分镜脚本与文案 |
 | `render.py` | 逐帧渲染引擎（多进程） |
-| `bgm.py` | 程序化 BGM 合成 |
+| `bgm.py` | 配乐编曲（段落结构 / 和声进行 / 节奏型） |
+| `dsp.py` | DSP 积木：滤波、软饱和、卷积混响、中侧处理、抖动 |
+| `instruments.py` | 乐器合成：木琴 / 电钢 / 弦垫 / 贝斯 / 鼓组 |
+| `voice.py` | 中文解说文案 + Edge-TTS 合成 |
+| `timeline.py` | 时间轴：场景顺序、各幕时长、旁白落点 |
+| `subtitles.py` | 字幕切条与断行 |
+| `subtitle_draw.py` | 字幕底衬绘制 |
+| `mix.py` | 人声 + 配乐混音、侧链闪避、响度归一 |
+| `encode.py` | 编码与合成成片 |
 
 ## 说明
 
 > 本构建用 ffmpeg 无 `libx264`，H.264 编码走 `libopenh264`。
 > 字体使用系统内置 `WenQuanYi Zen Hei`（版权不涉第三方素材）。
-> 成片为无声讲解 + 字幕/文案呈现，未使用真人配音。
+> 配音由 Edge-TTS 生成（微软在线语音合成，非真人录音但为真人声学模型），
+> 画面同时保留字幕，方便静音观看。
+>
+> 声音全部程序化生成 / 合成，**不含任何第三方音乐素材**，无版权风险。

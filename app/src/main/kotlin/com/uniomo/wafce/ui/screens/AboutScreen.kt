@@ -8,7 +8,6 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,7 +23,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Android
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Description
@@ -36,6 +34,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.Card
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -44,6 +43,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -76,9 +79,9 @@ private const val DEV_SITE_NAME = "uniomo.com"
 /**
  * 「关于」页：本应用自身的版本与项目信息 + 当前连接的 WAF 引擎信息。
  *
- * 两个入口共用：
- * - 系统管理 → 关于
- * - 主界面顶栏 → 关于
+ * 唯一入口：系统管理 → 关于（由 [com.uniomo.wafce.ui.screens.SystemScreen] 内嵌渲染）。
+ * 曾经还存在一条独立路由 `Route.About`，但主界面顶栏的「关于」按钮已移除，
+ * 该路由无人导航、永远不可达，已随之删除。
  *
  * @param updateVm 传入时展示「检查更新」区块。更新入口原本在顶栏，
  *                 但顶栏空间宝贵且刷新/更新两个按钮挤在一起，现已下沉到本页。
@@ -87,10 +90,10 @@ private const val DEV_SITE_NAME = "uniomo.com"
 fun AboutScreen(
     account: com.uniomo.wafce.data.store.AccountProfile?,
     appVm: AppViewModel,
-    onBack: (() -> Unit)? = null,
     updateVm: UpdateVm? = null
 ) {
     val ctx = LocalContext.current
+    var confirmLogout by remember { mutableStateOf(false) }
 
     Column(
         Modifier
@@ -108,21 +111,6 @@ fun AboutScreen(
                 .padding(horizontal = 20.dp, vertical = 22.dp)
         ) {
             Column(Modifier.fillMaxWidth()) {
-                // 从主界面顶栏进入时才显示返回（系统管理页签内不需要）
-                if (onBack != null) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        IconButton(onClick = onBack) {
-                            Icon(
-                                Icons.Default.Close,
-                                contentDescription = "返回",
-                                tint = Color.White
-                            )
-                        }
-                    }
-                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
@@ -234,7 +222,7 @@ fun AboutScreen(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
-                    TextButton(onClick = { appVm.logout() }) {
+                    TextButton(onClick = { confirmLogout = true }) {
                         Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("退出")
@@ -254,6 +242,26 @@ fun AboutScreen(
         }
 
         Spacer(Modifier.height(28.dp))
+    }
+
+    // 退出登录二次确认。
+    // 项目内其它破坏性操作（删除站点/ 规则 / 证书 / 用户 / Token / 实例）都有确认弹窗，
+    // 只有退出登录没有，用户误触后需要重新走一遍连接流程。
+    if (confirmLogout) {
+        AlertDialog(
+            onDismissRequest = { confirmLogout = false },
+            title = { Text("退出登录") },
+            text = { Text("退出后需要重新输入 API Token 才能连接该实例。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLogout = false
+                    appVm.logout()
+                }) { Text("退出", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLogout = false }) { Text("取消") }
+            }
+        )
     }
 }
 

@@ -191,10 +191,14 @@ class SystemVm : ViewModel() {
     fun loadTokens(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
             loadInto("token", my, { tokens = it }) {
-                // 9.4.x 的 /api/open/auth/token 返回的 data 是「字符串」而非对象，
-                // 直接当对象解析会报「返回数据格式非对象」，这里按原始类型分别处理。
+                // /api/open/auth/token 的 data 形态随版本变化很大：
+                //   9.4.x 是**字符串**（直接当对象解析会报「返回数据格式非对象」）
+                //   另一些版本是数组，或 {total, nodes:[...]} 分页外壳
+                // 因此逐类型分派，且**只收录真的是一条 Token 记录的对象**——
+                // 把分页外壳或字段映射表当记录渲染，会产生一行「ID 0」的垃圾数据，
+                // 而点它的删除按钮会删掉当前正在用的凭据导致自锁。
                 val api = ApiClient.apiFor(account)
-                val data = Resp.unwrap(api.apiTokens(emptyMap()))
+                val data = Resp.unwrap(api.apiTokens(mapOf("page" to "1", "page_size" to "100")))
                 val out = mutableListOf<JsonObject>()
                 when {
                     data.isJsonPrimitive -> out.add(
@@ -203,9 +207,22 @@ class SystemVm : ViewModel() {
                             addProperty("token", data.asString)
                         }
                     )
-                    data.isJsonObject -> out.add(data.asJsonObject)
                     data.isJsonArray -> data.asJsonArray.mapNotNullTo(out) {
                         if (it.isJsonObject) it.asJsonObject else null
+                    }
+                    data.isJsonObject -> {
+                        val o = data.asJsonObject
+                        // 外壳里可能藏着 nodes/data 列表
+                        val nested = Resp.nodes(o).ifEmpty {
+                            Resp.firstArray(o)?.mapNotNull { if (it.isJsonObject) it.asJsonObject else null }
+                                ?: emptyList()
+                        }
+                        if (nested.isNotEmpty()) {
+                            out.addAll(nested)
+                        } else if (looksLikeTokenRecord(o)) {
+                            out.add(o)
+                        }
+                        // 否则既不是列表也不是单条记录 -> 返回空列表，UI 显示「暂无 API Token 信息」
                     }
                 }
                 out
@@ -213,14 +230,28 @@ class SystemVm : ViewModel() {
         }
     }
 
+    /**
+     * 判断一个对象是否**确实是一条 Token 记录**，而不是分页外壳或字段映射表。
+     * 必须能识别 token 字段，否则真正的单条记录会被误当外壳丢弃。
+     */
+    private fun looksLikeTokenRecord(o: JsonObject): Boolean =
+        Resp.str(o, "token", "api_token", "value").isNotBlank()
+
     fun loadNotices(account: AccountProfile, my: Int = epoch) {
         viewModelScope.launch {
             // 告警通知属商业版能力，社区版返回 403 license required，会被自动隐藏
             loadInto("notice", my, { notices = it }) {
-                val raw = Resp.obj(ApiClient.apiFor(account).alarm())
+                val raw = runCatching { Resp.obj(ApiClient.apiFor(account).alarm()) }
+                    .getOrDefault(com.google.gson.JsonObject())
                 val arr = Resp.firstArray(raw)
-                if (arr != null) arr.mapNotNull { if (it.isJsonObject) it.asJsonObject else null }
-                else listOf(raw)
+                when {
+                    arr != null -> arr.mapNotNull { if (it.isJsonObject) it.asJsonObject else null }
+                    // 兜底只在 raw 本身像一条记录（有 id 或名称字段）时才收录，
+                    // 否则把外壳对象当策略渲染会出现一行「ID 0」的垃圾数据
+                    Resp.l(raw, "id") > 0L ||
+                        Resp.str(raw, "name", "comment", "title").isNotBlank() -> listOf(raw)
+                    else -> emptyList()
+                }
             }
         }
     }
@@ -244,12 +275,17 @@ class SystemVm : ViewModel() {
         assign: (UiState<T>) -> Unit,
         block: suspend () -> T
     ) {
+        // 代次校验必须在写 Loading 之前，理由见 ProtectScreen.loadInto 的同名注释：
+        // 旧代次请求若先写 Loading，会把新代次的 Fail 覆盖成永久转圈。
+        if (my != epoch) return
         assign(UiState.Loading)
         try {
             val data = block()
             if (my != epoch) return
             assign(UiState.Success(data))
         } catch (e: Exception) {
+            // 协程取消属于正常终止，不能当失败处理
+            if (e is kotlinx.coroutines.CancellationException) throw e
             if (my != epoch) return
             if (isUnsupported(e)) {
                 if (key !in unsupported) unsupported = unsupported + key
@@ -266,10 +302,13 @@ class SystemVm : ViewModel() {
         e is LicenseRequiredException ||
             (e is HttpStatusException && e.httpCode == 404)
 
-    private fun list(body: JsonObject): List<JsonObject> {
-        val raw = Resp.obj(body)
-        return Resp.nodes(raw).ifEmpty { Resp.arr(body) }
-    }
+    /**
+     * 列表接口统一解析。
+     * 委托给 [Resp.listOf]，它按 data 的真实类型（对象 / 数组 / 标量）三态分派且永不抛异常。
+     * 原写法 `Resp.nodes(Resp.obj(body)).ifEmpty { Resp.arr(body) }` 里，
+     * obj() 在 data 为数组时就已经抛「返回数据格式非对象」，那个 ifEmpty 兜底永远不生效。
+     */
+    private fun list(body: JsonObject): List<JsonObject> = Resp.listOf(body)
 
     fun openCertEditor() { certEditorOpen = true }
     fun closeCertEditor() { certEditorOpen = false }
@@ -599,7 +638,15 @@ fun SystemScreen(account: AccountProfile, appVm: AppViewModel, updateVm: UpdateV
     }
 }
 
-/** 用户新增/编辑弹窗。字段用 rememberSaveable，旋转屏幕不丢已输入内容。 */
+/**
+ * 用户新增/编辑弹窗。
+ *
+ * 用户名/角色用 rememberSaveable（旋转屏幕不丢，非敏感）。
+ * **密码刻意用普通 remember**：rememberSaveable 的值会进入 onSaveInstanceState 的 Bundle，
+ * 而部分厂商 ROM 与备份链路会把该 Bundle 落盘 —— 明文密码不应进入系统持久化状态，
+ * 这与项目里CipherBox 用 Keystore 加密持久化凭据的设计自相矛盾。
+ * 旋转屏幕后需重新输入密码，这是可接受的代价。
+ */
 @Composable
 private fun UserDialog(
     working: Boolean,
@@ -609,7 +656,7 @@ private fun UserDialog(
     onSave: (UserEdit) -> Unit
 ) {
     var username by rememberSaveable(init.id) { mutableStateOf(init.username) }
-    var password by rememberSaveable(init.id) { mutableStateOf("") }
+    var password by remember(init.id) { mutableStateOf("") }
     var role by rememberSaveable(init.id) { mutableStateOf(init.role) }
     var showPwd by rememberSaveable(init.id) { mutableStateOf(false) }
 
@@ -799,10 +846,13 @@ private fun CertDialog(
 ) {
     // 弹窗存在状态在 ViewModel 里，旋转屏幕后弹窗会重建。
     // 用 remember 的话用户粘贴的 PEM 内容会全部消失（动辄上千字符，重新粘贴成本极高），
-    // 所以这里必须 rememberSaveable。
+    // 所以证书内容用 rememberSaveable。
     var comment by rememberSaveable { mutableStateOf("") }
     var crt by rememberSaveable { mutableStateOf("") }
-    var key by rememberSaveable { mutableStateOf("") }
+    // **TLS 私钥例外**：rememberSaveable 会把值带进 onSaveInstanceState 的 Bundle，
+    // 部分 ROM 与备份链路会把它落盘。私钥属于高敏感凭据，不应进入系统持久化状态，
+    // 这里用普通 remember，旋转后需重新粘贴。
+    var key by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,

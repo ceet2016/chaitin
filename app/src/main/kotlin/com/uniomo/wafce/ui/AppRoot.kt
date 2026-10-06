@@ -40,6 +40,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,7 +55,6 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.uniomo.wafce.data.store.AccountProfile
-import com.uniomo.wafce.ui.screens.AboutScreen
 import com.uniomo.wafce.ui.screens.AccountsScreen
 import com.uniomo.wafce.ui.screens.DashTarget
 import com.uniomo.wafce.ui.screens.DashboardScreen
@@ -76,7 +76,6 @@ object Route {
     const val Protect = "protect"
     const val Logs = "logs"
     const val System = "system"
-    const val About = "about"
     const val SiteDetail = "site/{id}"
 
     /** 携带跳转上下文的路由变体，参数在 composable 上解析 */
@@ -184,7 +183,9 @@ private fun MainScaffoldInner(vm: AppViewModel, account: AccountProfile) {
     }
     val backStack by nav.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
-    var sheetOpen by remember { mutableStateOf(false) }
+    // rememberSaveable：旋转屏幕不该把「已打开的账号切换面板」关掉，
+    // 这与 nav（rememberNavController，本身就是 saveable）保持一致的持久化语义
+    var sheetOpen by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -252,14 +253,6 @@ private fun MainScaffoldInner(vm: AppViewModel, account: AccountProfile) {
             composable(Route.Protect) { ProtectScreen(account) }
             composable(Route.Logs) { LogsScreen(account) }
             composable(Route.System) { SystemScreen(account, vm, updateVm) }
-            composable(Route.About) {
-                AboutScreen(
-                    account = account,
-                    appVm = vm,
-                    onBack = { nav.popBackStack() },
-                    updateVm = updateVm
-                )
-            }
             composable(
                 route = Route.LogsAt,
                 arguments = listOf(navArgument(Route.ARG_TAB) {
@@ -375,7 +368,6 @@ private fun titleOf(route: String?): String {
         Route.Protect -> "防护配置"
         Route.Logs -> "日志中心"
         Route.System -> "系统管理"
-        Route.About -> "关于"
         Route.SiteDetail -> "站点详情"
         else -> "总览"
     }

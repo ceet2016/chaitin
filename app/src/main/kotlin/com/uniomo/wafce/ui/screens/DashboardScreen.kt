@@ -165,6 +165,16 @@ data class RealtimeEvent(
     val timeText: String
 )
 
+/**
+ * 趋势探测失败时的兜底值。
+ *
+ * 必须放在顶层而不能放companion object：fetch 里用 async{...}.getOrElse { EMPTY_TREND }，
+ * lambda 上下文虽在类里，但显式引用 companion 成员在 Kotlin 里容易踩到初始化顺序问题，
+ * 顶层 private val 最简单也最安全。
+ */
+private val EMPTY_TREND: Triple<List<Float>, List<String>, String> =
+    Triple(emptyList(), emptyList(), "")
+
 class DashboardVm : ViewModel() {
 
     var state: UiState<DashboardData> by mutableStateOf(UiState.Idle)
@@ -219,9 +229,11 @@ class DashboardVm : ViewModel() {
             val vRealtime = async { runCatching { api.securityRealtime(emptyMap()) } }
             val vPosture = async { runCatching { api.securityPosture() } }
 
-            // 趋势：近 24 小时优先，无数据再退近 7 天；两者皆无则不渲染卡片
-            val vAccess = async { trend(ACCESS_TREND_PATHS) }
-            val vBlock = async { trend(BLOCK_TREND_PATHS) }
+            // 趋势：近 24 小时优先，无数据再退近 7 天；两者皆无则不渲染卡片。
+            // 必须包 runCatching：coroutineScope 里任一子协程抛异常会让整页失败，
+            // 而趋势/统计属于「有则显示、无则隐藏」的增强内容，不该拖垮基础指标。
+            val vAccess = async { runCatching { trend(ACCESS_TREND_PATHS) }.getOrElse { EMPTY_TREND } }
+            val vBlock = async { runCatching { trend(BLOCK_TREND_PATHS) }.getOrElse { EMPTY_TREND } }
 
             val access = vAccess.await()
             val block = vBlock.await()
@@ -234,20 +246,29 @@ class DashboardVm : ViewModel() {
                 ?: 24L * 3600L
             val nowSec = System.currentTimeMillis() / 1000L
 
-            // 汇总指标取不到就返回 null，UI 层隐藏整个区块（不显示假 0）
+            // 汇总指标取不到就返回 null，UI 层隐藏整个区块（不显示假 0）。
+            // 一律包 runCatching：任一探测抛异常都不应影响其他指标。
             val accessSum = async {
-                ApiClient.probeAccessSummary(targetId, ACCESS_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                runCatching {
+                    ApiClient.probeAccessSummary(targetId, ACCESS_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                }.getOrNull()
             }
             val interceptSum = async {
-                ApiClient.probeInterceptSummary(targetId, INTERCEPT_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                runCatching {
+                    ApiClient.probeInterceptSummary(targetId, INTERCEPT_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                }.getOrNull()
             }
             // 4xx/5xx：社区版未公开该接口，只做候选探测，取不到就整块隐藏
             val errorSum = async {
-                ApiClient.probeErrorStatusSummary(targetId, ERROR_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                runCatching {
+                    ApiClient.probeErrorStatusSummary(targetId, ERROR_SUMMARY_PATHS, nowSec - winSec, nowSec)
+                }.getOrNull()
             }
             // 来源地分布：同样未公开，只做候选探测
             val geoRank = async {
-                ApiClient.probeGeoRank(targetId, GEO_PATHS, nowSec - winSec, nowSec)
+                runCatching {
+                    ApiClient.probeGeoRank(targetId, GEO_PATHS, nowSec - winSec, nowSec)
+                }.getOrNull()
             }
 
             DashboardData(

@@ -49,8 +49,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -190,9 +194,13 @@ class ProtectVm : ViewModel() {
     fun currentKey(): String = visibleTabs().getOrNull(tab)?.key ?: TAB_IPGROUP
 
     fun loadAll(account: AccountProfile) {
-        // 取消上一批在途请求并推进代次，避免切账号后旧响应串号。
+        // 推进代次，让上一批尚未返回的请求结果全部作废（账号已切换）。
         // epoch 必须在协程外推进：loadAll 之后紧跟的单个 load*() 要能读到新值。
-        loadJob?.cancel()
+        //
+        // 注意 loadJob?.cancel() 只能取消下面这个「顺序派发 5 次」的编排协程，
+        // 它在派发完就结束了；5 个 load* 各自 viewModelScope.launch，
+        // 父协程是 viewModelScope 而不是 loadJob，取消对其无效。
+        // 因此真正防串号的是 epoch 校验，不是这里的 cancel —— 别误以为已有取消保护。
         val myEpoch = ++epoch
         loadJob = viewModelScope.launch {
             loadGroups(account, myEpoch)
@@ -214,12 +222,18 @@ class ProtectVm : ViewModel() {
         assign: (UiState<T>) -> Unit,
         block: suspend () -> T
     ) {
+        // 代次校验必须在写 Loading **之前**：
+        // 旧代次的请求结果虽然会被丢弃，但它若先把该页签打成「加载中」，
+        // 而新代次随后失败写了 Fail，就会出现「Fail 被后到的 Loading 覆盖 → 永久转圈」。
+        if (my != epoch) return
         assign(UiState.Loading)
         try {
             val data = block()
             if (my != epoch) return
             assign(UiState.Success(data))
         } catch (e: Exception) {
+            // 协程取消属于正常终止，不能当失败处理
+            if (e is kotlinx.coroutines.CancellationException) throw e
             if (my != epoch) return
             if (isUnsupported(e)) {
                 if (key !in unsupported) unsupported = unsupported + key
@@ -237,8 +251,7 @@ class ProtectVm : ViewModel() {
         viewModelScope.launch {
             loadInto(TAB_IPGROUP, my, { groups = it }) {
                 val body = ApiClient.apiFor(account).ipGroups(mapOf("page" to "1", "page_size" to "100"))
-                val raw = Resp.obj(body)
-                Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map {
+                Resp.listOf(body).map {
                     val original = Resp.strList(it, "original", "ips", "ip")
                     val cidrs = Resp.strList(it, "cidrs", "expanded")
                     IpGroupItem(
@@ -261,8 +274,7 @@ class ProtectVm : ViewModel() {
         viewModelScope.launch {
             loadInto(TAB_RULE, my, { rules = it }) {
                 val body = ApiClient.apiFor(account).rules(mapOf("page" to "1", "page_size" to "100"))
-                val raw = Resp.obj(body)
-                Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map { o ->
+                Resp.listOf(body).map { o ->
                     val action = Resp.l(o, "action")
                     RuleItem(
                         id = Resp.l(o, "id"),
@@ -297,8 +309,7 @@ class ProtectVm : ViewModel() {
                 val body = ApiClient.apiFor(account).policies(
                     mapOf("page" to "1", "page_size" to "100", "action" to "-1")
                 )
-                val raw = Resp.obj(body)
-                Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map {
+                Resp.listOf(body).map {
                     PolicyItem(
                         id = Resp.l(it, "id"),
                         name = Resp.str(it, "name", "comment", "title").ifBlank { "规则 ${Resp.l(it, "id")}" },
@@ -418,6 +429,28 @@ class ProtectVm : ViewModel() {
     fun openJsonEditor(kind: RawKind, json: String) { jsonEditor = JsonEdit(kind, json) }
     fun closeJsonEditor() { jsonEditor = null }
 
+    /**
+     * 待确认下发的全局配置。
+     * 专家模式的裸 JSON 编辑器语法检查只有「Gson 能否解析」，
+     * 用户手写一个合法的 `{}` 就会把WAF 的全局防护模式 / 全局访问控制直接清空，
+ * * 破坏性等同于「删除全部防护配置」，必须二次确认。
+     */
+    var pendingJsonSave by mutableStateOf<Pair<RawKind, String>?>(null)
+        private set
+
+    fun requestSaveJson(kind: RawKind, text: String) {
+        // 先本地解析一次：语法错误直接在这里拦下，不弹确认框
+        val parsed = runCatching { GsonBuilder().create().fromJson(text, JsonObject::class.java) }
+            .getOrNull()
+        if (parsed == null) {
+            message = "JSON 语法有误，请检查后再下发"
+            return
+        }
+        pendingJsonSave = kind to text
+    }
+
+    fun cancelSaveJson() { pendingJsonSave = null }
+
     fun saveJson(account: AccountProfile, kind: RawKind, text: String) {
         viewModelScope.launch {
             working = true
@@ -432,6 +465,7 @@ class ProtectVm : ViewModel() {
                 closeJsonEditor()
                 "配置已下发"
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 "配置更新失败：${e.readable()}"
             }
             working = false
@@ -597,7 +631,43 @@ fun ProtectScreen(account: AccountProfile, initialTabKey: String? = null) {
             initial = edit.json,
             working = vm.working,
             onDismiss = { vm.closeJsonEditor() },
-            onSave = { vm.saveJson(account, edit.kind, it) }
+            onSave = { vm.requestSaveJson(edit.kind, it) }
+        )
+    }
+
+    // 全局配置下发的二次确认：一次错误的全局配置会影响所有站点的防护策略
+    vm.pendingJsonSave?.let { (kind, text) ->
+        val keyCount = runCatching {
+            GsonBuilder().create().fromJson(text, JsonObject::class.java).size()
+        }.getOrDefault(0)
+        AlertDialog(
+            onDismissRequest = { vm.cancelSaveJson() },
+            title = { Text("下发${kind.title}") },
+            text = {
+                // 用 AnnotatedString 做局部加粗：Compose 的Text 不解析 Markdown，
+                // 直接写 ** 会原样显示星号
+                val warn = "全部防护站点"
+                Text(
+                    buildAnnotatedString {
+                        append("即将用你编辑的内容覆盖当前${kind.title}配置（$keyCount 个顶层字段）。\n")
+                        append("该配置作用于")
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(warn) }
+                        append("，下发后立即生效且不可撤销。\n\n确认继续？")
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.cancelSaveJson()
+                        vm.saveJson(account, kind, text)
+                    },
+                    enabled = !vm.working
+                ) { Text("确认下发", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.cancelSaveJson() }) { Text("取消") }
+            }
         )
     }
 }

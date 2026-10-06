@@ -131,13 +131,30 @@ class LogsVm : ViewModel() {
         private set
 
     /** 分页结果缓存：切回已看过的页时立即出内容，避免每次都转圈 */
-    private val cache = java.util.concurrent.ConcurrentHashMap<Pair<Int, Int>, List<LogEntry>>()
+    private val cache = java.util.concurrent.ConcurrentHashMap<Triple<Long, Int, Int>, List<LogEntry>>()
+
+    /**
+     * 请求代次。
+     *
+     * 原本 LogsVm 没有 epoch，是三个日志页里唯一漏掉的一个。后果：
+     * 快速「下一页 → 点另一个页签」时，下面 load() 里读的 tab/page 是四个不同时刻的值
+     * （第①行取 key、协程内取 page 拼参数、取 kind 决定接口、最后再取 tab 写缓存），
+     * 于是会「用B 页签的页码去请求 A 接口」，并把结果写进另一个 key 的缓存槽。
+     * 更糟的是 cache 的键原本是 Pair<Int,Int>，**不含 accountId** ——
+     * A 账号第 2 页的缓存会被 B 账号同键命中直接上屏。
+     */
+    private var epoch = 0
 
     fun kind(): LogKind = LogKind.of(tab)
 
     fun load(account: AccountProfile) {
-        val key = tab to page
-        cache[key]?.let { cached ->
+        // 关键：把tab/page 快照成局部val，协程内全程只用快照，
+        // 不再读可变状态，从根上消除竞态
+        val myTab = tab
+        val myPage = page
+        val myEpoch = ++epoch
+
+        cache[Triple(account.id, myTab, myPage)]?.let { cached ->
             entries = cached
             refreshing = false
             error = null
@@ -147,27 +164,39 @@ class LogsVm : ViewModel() {
             error = null
             try {
                 val api = ApiClient.apiFor(account)
-                val q = mapOf("page" to page.toString(), "page_size" to "20")
-                val k = kind()
+                val q = mapOf("page" to myPage.toString(), "page_size" to "20")
+                val k = LogKind.of(myTab)
                 val body = when (k) {
                     LogKind.EVENT -> api.events(q)
                     LogKind.ACL -> api.recordsAcl(q)
                     LogKind.CHALLENGE -> api.recordsChallenge(q)
                     LogKind.AUTH -> api.recordsAuthDefense(q)
                 }
-                val raw = Resp.obj(body)
-                entries = Resp.nodes(raw).ifEmpty { Resp.arr(body) }.map { buildEntry(it) }
-                cache[tab to page] = entries
+                // listOf 统一按data 的真实类型分派，比 nodes().ifEmpty{arr()} 更能兜住版本差异
+                val list = Resp.listOf(body).map { buildEntry(it) }
+                // 代次校验：慢返回的旧请求结果直接丢弃，不污染当前界面
+                if (myEpoch != epoch) return@launch
+                entries = list
+                cache[Triple(account.id, myTab, myPage)] = list
             } catch (e: Exception) {
+                // 协程取消属于正常终止，不能当失败，更不能清空已有数据
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (myEpoch != epoch) return@launch
                 error = e.readable()
-                entries = emptyList()
+                // 刻意不清空 entries：瞬时网络抖动不该把已显示的 20 条数据变成空白页。
+                // 错误提示由 UI 层在entries 为空时才整页替换。
             }
-            refreshing = false
+            if (myEpoch == epoch) refreshing = false
         }
     }
 
     fun setTab(account: AccountProfile, index: Int) {
-        if (index == tab) return
+        if (index == tab) {
+            // 已经是该页签，但可能还没加载过（深链直达 tab=0 时首屏就是空）。
+            // 这里不能简单 return —— 否则深链进入日志页会一片空白。
+            if (entries.isEmpty() && error == null) load(account)
+            return
+        }
         tab = index
         page = 1
         load(account)
@@ -239,8 +268,11 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
     // 会导致弹窗「点不开 / 关不掉」
     val detail by vm.detail.collectAsState()
 
-    DisposableEffect(account.id) {
-        vm.load(account)
+    DisposableEffect(account.id, initialTab) {
+        // key 带上 initialTab：深链进入时首次加载就直接按目标页签发起，
+        // 否则会先按 tab=0 请求一次再改tab，多余且第一屏内容与高亮不符
+        if (initialTab >= 0) vm.setTab(account, initialTab.coerceIn(0, LOG_TABS.lastIndex))
+        else vm.load(account)
         onDispose { }
     }
 
@@ -248,12 +280,14 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
     // 必须做上界收口：路由 logs?tab={tab} 是外部可见的深链入口，
     // 传进来的值超过页签数量时 TabRow(selectedTabIndex = 99) 会直接抛
     // IndexOutOfBoundsException 崩掉整页。
+    //
+    // 注意这里**不能**先写 vm.tab = safe 再调 setTab：
+    // setTab 首行是 `if (index == tab) return`，tab 已被改掉就会早退，
+    // load() 永远不执行 —— 结果高亮在目标页签、内容却是上一个页签的数据，
+    // 且不会自动纠正（首页5 个指标卡入口里有 3 个会踩到）。
     LaunchedEffect(initialTab) {
         val safe = initialTab.coerceIn(0, LOG_TABS.lastIndex)
-        if (initialTab >= 0 && safe != vm.tab) {
-            vm.tab = safe
-            vm.setTab(account, safe)
-        }
+        if (initialTab >= 0) vm.setTab(account, safe)
     }
 
     val safeTab = vm.tab.coerceIn(0, LOG_TABS.lastIndex)
@@ -287,11 +321,31 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
         }
 
         val error = vm.error
-        if (error != null) {
+        // 只在「一条数据都没有」时才整页替换成错误页。
+        // 否则用户翻到第 5 页后一次网络抖动，就会把屏上 20 条数据全换成一句报错——
+        // 瞬时抖动被放大成数据丢失。有数据时用顶部细条提示，列表保留。
+        if (error != null && vm.entries.isEmpty()) {
             EmptyBox("读取失败：$error")
         } else if (vm.entries.isEmpty()) {
             EmptyBox(if (vm.refreshing) "加载中…" else "本页暂无记录")
         } else {
+            // 有数据但刷新失败：内联提示条，不打断用户阅读
+            if (error != null) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "刷新失败：$error",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Danger,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { vm.load(account) }) { Text("重试") }
+                }
+            }
             LazyColumn(Modifier.fillMaxSize()) {
                 // 日志翻页后内容完全换一批，必须给 key，否则按位复用会导致
                 // 「条目内容串位」；id 缺失时带下标兜底，避免 key 撞车崩溃

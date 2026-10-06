@@ -59,6 +59,42 @@ object Resp {
         return emptyList()
     }
 
+    /**
+     * **列表接口的统一入口**：把 `data` 无论是对象、数组还是标量都解析成列表，永不抛异常。
+     *
+     * 为什么必须有这个方法：列表接口的 `data` 在不同版本/形态下并不统一
+     * （可能是 `{total, nodes:[...]}`、裸数组、甚至标量）。
+     * 之前的写法是 `Resp.nodes(Resp.obj(body)).ifEmpty { Resp.arr(body) }`，
+     * 但 [obj] 在 data 非对象时就会抛「返回数据格式非对象」——
+     * 也就是说需要走数组分支的场景，早在上一行就已经抛异常了，那个 ifEmpty 兜底
+     * **永远不可能生效**，属于纯装饰性死代码。某版本把data 改成数组，整页直接崩。
+     *
+     * 这里直接按 data 的真实类型三态分派，才是真正能兜住版本差异的实现。
+     *
+     * @param body 服务端响应外壳
+     * @return 解析出的列表；结构无法识别时返回空列表（由调用方决定显示空态还是错误）
+     */
+    fun listOf(body: JsonObject?): List<JsonObject> {
+        val data = runCatching { unwrap(body) }.getOrNull() ?: return emptyList()
+        return when {
+            data.isJsonNull -> emptyList()
+            // 裸数组：直接逐项取对象（分页信息在外层 err/msg 之外时才成立）
+            data.isJsonArray -> data.asJsonArray.mapNotNull {
+                if (it.isJsonObject) it.asJsonObject else null
+            }
+            // 对象：先找分页列表键，找不到再找任意嵌套数组
+            data.isJsonObject -> {
+                val o = data.asJsonObject
+                val nested = nodes(o)
+                if (nested.isNotEmpty()) nested
+                else firstArray(o)?.mapNotNull { if (it.isJsonObject) it.asJsonObject else null }
+                    ?: emptyList()
+            }
+            // 标量不是列表
+            else -> emptyList()
+        }
+    }
+
     fun total(parent: JsonObject?): Int {
         if (parent == null) return 0
         return first(parent, "total", "count") ?: 0

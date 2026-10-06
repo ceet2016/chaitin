@@ -3,6 +3,7 @@ package com.uniomo.wafce.vm
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
@@ -15,7 +16,7 @@ import com.uniomo.wafce.core.HttpDiag
 import com.uniomo.wafce.core.HttpStatusException
 import com.uniomo.wafce.core.Resp
 import com.uniomo.wafce.core.Totp
-import com.uniomo.wafce.core.safeCall
+import com.uniomo.wafce.core.UnauthorizedException
 import com.uniomo.wafce.data.net.ApiClient
 import com.uniomo.wafce.data.net.SafeLineApi
 import com.uniomo.wafce.data.net.SessionStore
@@ -40,6 +41,8 @@ sealed class LoginOutcome {
  * - SESSION 模式支持用保存的密码 + TOTP 密钥静默重登
  * - 任意接口返回 401 都会经 [AuthEvents] 回到登录态
  */
+private const val TAG = "SafeLineClient"
+
 class AppViewModel : ViewModel() {
 
     var accounts: List<AccountProfile> by mutableStateOf(emptyList())
@@ -69,7 +72,17 @@ class AppViewModel : ViewModel() {
         reload()
         AuthEvents.unauthorized
             .onEach { id ->
-                if (id == -1L || current?.id == id) {
+                // id == -1L 表示「无法确定是哪个账号」（safeCall 的默认值）。
+                // 此时**不能**无条件踢人，否则任何一次归属不明的 401 都会把当前账号登出。
+                // 现在 401 统一由 HttpErrorInterceptor 带 accountId 上报，
+                // 正常情况下不会走到 -1L 分支；保留判断只是为了兜底。
+                val hit = if (id == -1L) {
+                    Log.w(TAG, "收到无归属的 401 通知，忽略（不改变当前会话）")
+                    false
+                } else {
+                    current?.id == id
+                }
+                if (hit) {
                     sessionState = SessionState.NEED_LOGIN
                     sessionEpoch++
                 }
@@ -129,11 +142,33 @@ class AppViewModel : ViewModel() {
         return saved.id
     }
 
+    /**
+     * 删除实例。
+     *
+     * 两个容易漏的点：
+     * 1. **必须先 invalidate**。账号 id 是序号式生成的（maxId+1），
+     *    删掉最大的那个再新增就会**复用同一个 id**。若先 delete 再 invalidate，
+     *    期间并发新增抢到同一 id 时会把新账号刚建的 client 一起清掉；
+     *    而不 invalidate 则更糟——旧账号的 OkHttpClient 残留，新账号 baseUrl 相同时
+     *    直接复用，若trustAllCert 不同就会出现「明明开了证书校验却仍握手失败」的死锁。
+     * 2. **必须 sessionEpoch++**。删掉当前账号时 AccountStore 会把current 指向别的账号，
+     *    但 sessionState 仍是 AUTHENTICATED，界面不会重建，
+     *    用户会继续在旧账号的 NavController 里操作。
+     */
     fun deleteAccount(id: Long) {
+        ApiClient.invalidate(id)
         AccountStore.delete(id)
         SessionStore.clear(id)
         reload()
-        if (current == null) sessionState = SessionState.NEED_LOGIN
+        val next = current
+        if (next == null) {
+            sessionState = SessionState.NEED_LOGIN
+            sessionEpoch++
+        } else {
+            sessionEpoch++
+            sessionState = SessionState.UNKNOWN
+            viewModelScope.launch { ensureSession(next) }
+        }
     }
 
     /**
@@ -175,24 +210,42 @@ class AppViewModel : ViewModel() {
     /**
      * 只校验 API Token：请求一次 /api/open/system，能拿到数据即视为可接入。
      * 不再走账号密码登录（该接口有连续失败风控，触发后长时间不可用）。
+     *
+     * 两点关键：
+     * - **只有明确的凭据问题才判NEED_LOGIN**。网络超时 / SSL 握手失败 / 服务端 5xx
+     *   都说明 Token 可能仍是好的，原实现一律判 NEED_LOGIN 会让用户误以为 Token 过期，
+     *   白白重走一遍连接流程，而根因其实是网络。这些情况保持 UNKNOWN 让用户重试。
+     * - **带代次校验**。快速连续切两个账号时，两个 ensureSession 并发，
+     *   慢的那个返回后若无条件覆盖 sessionState，界面状态会与 current 不一致。
      */
     private suspend fun ensureSession(account: AccountProfile) {
+        val myEpoch = sessionEpoch
         sessionState = SessionState.UNKNOWN
         val token = AccountStore.secretOf(account.id).apiToken
         if (token.isBlank()) {
-            sessionState = SessionState.NEED_LOGIN
+            if (myEpoch == sessionEpoch) sessionState = SessionState.NEED_LOGIN
             return
         }
-        val result = runCatching { Resp.obj(ApiClient.apiFor(account).systemInfo()) }
-        sessionState = if (result.isSuccess) SessionState.AUTHENTICATED else SessionState.NEED_LOGIN
-        if (result.isFailure) {
-            AccountStore.setLastError(account.id, vmReadable(result.exceptionOrNull()!!))
+        val result = runCatching { Resp.unwrap(ApiClient.apiFor(account).systemInfo()) }
+        // 过期结果直接丢弃，不影响当前账号的界面状态
+        if (myEpoch != sessionEpoch || current?.id != account.id) return
+        val e = result.exceptionOrNull()
+        sessionState = when {
+            result.isSuccess -> SessionState.AUTHENTICATED
+            // 明确的鉴权失败：Token 无效 / 被吊销 / 业务拒绝
+            e is UnauthorizedException -> SessionState.NEED_LOGIN
+            e is ApiException -> SessionState.NEED_LOGIN
+            // 网络 / SSL / 服务端故障：Token 大概率仍是有效的，保留当前态让用户重试
+            else -> SessionState.UNKNOWN
+        }
+        if (sessionState != SessionState.AUTHENTICATED) {
+            AccountStore.setLastError(account.id, vmReadable(e ?: ApiException("未知错误")))
         }
     }
 
     fun setSessionAuthed() { sessionState = SessionState.AUTHENTICATED }
 
-    fun setNeedTotp() { sessionState = SessionState.NEED_TOTP }
+    fun setNeedTotp() { sessionState = SessionState.NEED_TOTP } // 见 performLogin 的说明
 
     // ---------------- 登录 ----------------
 
@@ -229,7 +282,8 @@ class AppViewModel : ViewModel() {
         }
     }
 
-    /** 保存 TOTP 密钥，用于后续自动登录 */
+    /** 保存 TOTP 密钥，供 [performLogin] 的两步验证使用 */
+    @Suppress("unused")
     fun persistTotpSecret(id: Long, secretKey: String) {
         val s = AccountStore.secretOf(id)
         AccountStore.save(
@@ -243,7 +297,18 @@ class AppViewModel : ViewModel() {
      *
      * 附带一次协议回退：部分内网/反向代理环境只提供 http 控制台，
      * 若地址是按 https 自动补全的，会在失败后自动改用 http 重试一次。
+     *
+     * ⚠️ **当前无调用点**：登录页只提供「API Token」一种接入方式
+     * （见 LoginScreen → [loginWithToken]），用户名密码路径没有 UI 入口。
+     * 这条链连同 [handshakeLogin] / [fetchCsrf] / [shouldTryHttp] 一并保留，
+     * 是因为它**功能完整且自洽**（csrf、协议回退、TFA 都已实现），
+     * 一旦后续要加回密码登录，接线即可。
+     * **不要因为「看起来是死代码」就顺手删掉** —— 同时被它撑着的还有
+     * `AuthMode.SESSION` 分支（[com.uniomo.wafce.data.net.AuthInterceptor]）、
+     * `SessionStore` 的 JWT 缓存、`SessionState.NEED_TOTP` 状态与 TOTP 密钥存储，
+     * 删一半会让整套 SESSION 认证能力变成无源的残骸。
      */
+    @Suppress("unused")
     private suspend fun performLogin(
         account: AccountProfile,
         password: String,
@@ -270,7 +335,10 @@ class AppViewModel : ViewModel() {
     /**
      * 取 CSRF 令牌。不同版本字段名可能是 csrf_token / token / csrf，
      * 极端情况下兜底取 data 里唯一的字符串字段。
+     *
+     * 仅 [handshakeLogin] 使用，见那里的说明。
      */
+    @Suppress("unused")
     private suspend fun fetchCsrf(api: SafeLineApi): String {
         val data = Resp.obj(api.csrf())
         val direct = Resp.str(data, "csrf_token", "token", "csrf", "csrfToken", "csrfCode")
@@ -299,13 +367,16 @@ class AppViewModel : ViewModel() {
         }
     }
 
-    /** 仅在「协议明显不匹配」或 TLS 握手失败时才回退，避免掩盖真实错误 */
+    /** 仅在「协议明显不匹配」或 TLS 握手失败时才回退，避免掩盖真实错误。见 [performLogin] */
+    @Suppress("unused")
     private fun shouldTryHttp(e: Throwable): Boolean = when (e) {
         is HttpStatusException -> HttpDiag.isSchemeMismatch(e.body)
         is javax.net.ssl.SSLException -> true
         else -> false
     }
 
+    /** [performLogin] 的单次握手：csrf -> 登录 -> 必要时TFA。见 performLogin 的说明 */
+    @Suppress("unused")
     private suspend fun handshakeLogin(
         account: AccountProfile,
         password: String,
@@ -381,7 +452,3 @@ class AppViewModel : ViewModel() {
 
 /** 供各页面统一使用的 Api 获取方式 */
 fun currentApi(account: AccountProfile) = ApiClient.apiFor(account)
-
-/** 统一的网络请求包装：把异常转成 Result，同时记录会话失效 */
-suspend fun <T> call(account: AccountProfile, block: suspend () -> T): Result<T> =
-    safeCall(account.id, block)

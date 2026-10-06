@@ -9,6 +9,7 @@ import okhttp3.Protocol
 import okhttp3.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import com.uniomo.wafce.core.AuthEvents
 import com.uniomo.wafce.core.HttpStatusException
 import com.uniomo.wafce.core.LicenseRequiredException
 import com.uniomo.wafce.core.Resp
@@ -58,8 +59,17 @@ private class AuthInterceptor(private val accountId: Long) : Interceptor {
     }
 }
 
-/** 统一把非 2xx 转成业务异常，并把服务端正文带上便于排查 */
-private class HttpErrorInterceptor : Interceptor {
+/**
+ * 统一把非 2xx 转成业务异常，并把服务端正文带上便于排查。
+ *
+ * 必须持有 accountId：401/403 时要发出 [AuthEvents.unauthorizedHappened]，
+ * 让 AppViewModel 把界面切回登录页。
+ *
+ * 为什么放在拦截器层而不是靠页面 catch：页面 catch 只能显示一条错误文案，
+ * 用户会停留在主界面且**无法自助恢复**，唯一出路是杀进程重开。
+ * 拦截器是所有请求的唯一收口，在这里 emit 才能保证「Token 被吊销后立刻回到登录页」。
+ */
+private class HttpErrorInterceptor(private val accountId: Long) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         logRequest(request)
@@ -75,6 +85,9 @@ private class HttpErrorInterceptor : Interceptor {
             if (resp.code == 403 && snippet.contains("license required", ignoreCase = true)) {
                 throw LicenseRequiredException()
             }
+            // 凭据确实失效：清会话缓存 + 通知 AppViewModel 切回登录页
+            runCatching { SessionStore.clear(accountId) }
+            AuthEvents.unauthorizedHappened(accountId)
             throw UnauthorizedException()
         }
         if (resp.code !in 200..299) {
@@ -143,11 +156,26 @@ private fun logRequest(request: okhttp3.Request) {
 object ApiClient {
 
     private val gson = Gson()
-    private val apiCache = ConcurrentHashMap<Long, Pair<String, SafeLineApi>>()
+
+    /**
+     * api 实例缓存。
+     *
+     * 缓存键必须包含 [AccountProfile.trustAllCert]——它决定是否装载
+     * 宽松的 sslSocketFactory 与 hostnameVerifier。只用 baseUrl 判命中时，
+     * 用户在设置里把「跳过证书校验」从关→开，会拿到**改造前**的 client，
+     * 表现为「明明开了校验却仍然握手失败」，且没有任何报错线索。
+     */
+    private data class CacheKey(
+        val id: Long,
+        val baseUrl: String,
+        val trustAllCert: Boolean
+    )
+
+    private val apiCache = ConcurrentHashMap<CacheKey, SafeLineApi>()
 
     fun apiFor(account: AccountProfile): SafeLineApi {
-        val cached = apiCache[account.id]
-        if (cached != null && cached.first == account.baseUrl) return cached.second
+        val key = CacheKey(account.id, account.baseUrl, account.trustAllCert)
+        apiCache[key]?.let { return it }
 
         val okHttp = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -166,7 +194,7 @@ object ApiClient {
                 }
             }
             .addInterceptor(AuthInterceptor(account.id))
-            .addInterceptor(HttpErrorInterceptor())
+            .addInterceptor(HttpErrorInterceptor(account.id))
             .build()
 
         val api = Retrofit.Builder()
@@ -176,13 +204,19 @@ object ApiClient {
             .build()
             .create(SafeLineApi::class.java)
 
-        apiCache[account.id] = account.baseUrl to api
+        // 同一 id 可能残留旧配置的实例（例如证书校验开关翻转前建的），清掉避免长期持有
+        apiCache.keys.filter { it.id == account.id }.forEach { apiCache.remove(it) }
+        apiCache[key] = api
         return api
     }
 
     fun invalidate(accountId: Long) {
-        apiCache.remove(accountId)
+        apiCache.keys.filter { it.id == accountId }.forEach { apiCache.remove(it) }
     }
+
+    /** 探测类接口只拿 accountId，这里按 id 取已缓存的 api；未缓存返回 null */
+    private fun cachedApi(accountId: Long): SafeLineApi? =
+        apiCache.entries.firstOrNull { it.key.id == accountId }?.value
 
     /**
      * 探测趋势统计接口。
@@ -211,8 +245,14 @@ object ApiClient {
     }
 
     /**
-     * 按候选顺序取第一个能成功解析的响应体，失败或返回空则继续试下一个。
+     * 按候选顺序取第一个「有内容」的响应体，失败或返回空则继续试下一个。
      * 统一收口让趋势与汇总指标探测共用同一套错误处理。
+     *
+     * **这里绝不能用 [Resp.obj] 判断是否有数据**：官方 OpenAPI 明确声明
+     * `/stat/advance/trend/access` 与 `/intercept` 的 `data` 是 **array**，
+     * 用 obj() 判定会抛「返回数据格式非对象」，而本函数没有 catch，
+     * 异常会一路穿透到 DashboardVm.fetch 的 coroutineScope，把整个总览页打挂。
+     * 因此改用「unwrap 后非空即算有内容」，具体是对象还是数组由调用方解析。
      */
     private suspend fun probeJson(
         accountId: Long,
@@ -220,19 +260,31 @@ object ApiClient {
         beginSec: Long,
         endSec: Long
     ): JsonObject? {
-        val api = apiCache[accountId]?.second ?: return null
+        val api = cachedApi(accountId) ?: return null
         val q = mapOf(
             "begin_time" to beginSec.toString(),
             "end_time" to endSec.toString()
         )
         for (path in candidates) {
+            // rawGet 失败（404 / 商业版 403 / 网络问题）都算这个候选不可用，换下一个
             val body = runCatching { api.rawGet(path, q) }.getOrNull() ?: continue
-            if (Resp.obj(body).size() > 0) return body
+            val data = runCatching { Resp.unwrap(body) }.getOrNull() ?: continue
+            val hasContent = when {
+                data == null || data.isJsonNull -> false
+                // 对象：至少一个非空字段才算有数据（空对象等于没有）
+                data.isJsonObject -> data.asJsonObject.size() > 0
+                // 数组：非空数组算有数据
+                data.isJsonArray -> data.asJsonArray.size() > 0
+                // 标量（字符串/数字/布尔）：非空字符串算有内容，交给上层解析
+                else -> data.isJsonPrimitive &&
+                        runCatching { data.asJsonPrimitive.asString.isNotBlank() }.getOrDefault(false)
+            }
+            if (hasContent) return body
         }
         return null
     }
 
-    /**
+/**
      * 探测访问侧汇总指标（请求次数 / PV / UV / 独立 IP）。
      *
      * 对应官方 stat.AdvanceAccessRes。字段在不同版本命名略有出入，
@@ -244,8 +296,8 @@ object ApiClient {
         beginSec: Long,
         endSec: Long
     ): AccessSummary? {
-        val body = probeJson(accountId, candidates, beginSec, endSec) ?: return null
-        val o = Resp.obj(body)
+        val o = dataObjOrNull(probeJson(accountId, candidates, beginSec, endSec), deep = true)
+            ?: return null
         val requests = Resp.l(o, "access", "request_count", "requests", "count", "total")
         val pv = Resp.l(o, "pv", "pv_count", "page_view")
         val uv = Resp.l(o, "session", "uv", "visitor_count", "visitors")
@@ -266,8 +318,8 @@ object ApiClient {
         beginSec: Long,
         endSec: Long
     ): InterceptSummary? {
-        val body = probeJson(accountId, candidates, beginSec, endSec) ?: return null
-        val o = Resp.obj(body)
+        val o = dataObjOrNull(probeJson(accountId, candidates, beginSec, endSec), deep = true)
+            ?: return null
         // intercept 在官方模型里是 object（按状态码分组），总数需要单独求和。
         // 兼容两种形态：对象分组求和 / 直接是数字。
         val interceptEl = o.get("intercept")
@@ -307,8 +359,8 @@ object ApiClient {
         beginSec: Long,
         endSec: Long
     ): ErrorStatusSummary? {
-        val body = probeJson(accountId, candidates, beginSec, endSec) ?: return null
-        val o = Resp.obj(body)
+        val o = dataObjOrNull(probeJson(accountId, candidates, beginSec, endSec), deep = true)
+            ?: return null
         val e4 = Resp.l(o, "error_4xx", "4xx", "err4xx", "error4xx", "client_error")
         val e5 = Resp.l(o, "error_5xx", "5xx", "err5xx", "error5xx", "server_error")
         // 全 0 说明这段时间没有错误，视为无数据而不是显示两个 0
@@ -333,13 +385,11 @@ object ApiClient {
         endSec: Long,
         topN: Int = 8
     ): GeoRank? {
-        val body = probeJson(accountId, candidates, beginSec, endSec) ?: return null
-        val o = Resp.obj(body)
+        val root = dataObjOrNull(probeJson(accountId, candidates, beginSec, endSec), deep = true)
+            ?: return null
         // geo 可能直接挂在根对象上，也可能包一层 {"geo": {...}}
-        val geo = Resp.obj(o).let { root ->
-            val nested = root.get("geo")
-            if (nested != null && nested.isJsonObject) Resp.obj(nested.asJsonObject) else root
-        }
+        val nested = root.get("geo")
+        val geo = if (nested != null && nested.isJsonObject) nested.asJsonObject else root
         val requestCountry = geoItems(geo, "request_country")
         val interceptCountry = geoItems(geo, "intercept_country")
         val requestProvince = geoItems(geo, "request_province")
@@ -415,3 +465,21 @@ data class GeoRank(
     val interceptCountry: List<GeoItem>,
     val requestProvince: List<GeoItem>
 )
+
+/**
+ * 取 `data` 里的对象，**不抛异常**，拿不到返回 null。
+ *
+ * 与 [Resp.obj] 的区别：Resp.obj 遇到非对象（数组 / 字符串）直接抛
+ * 「返回数据格式非对象」。探测类接口的候选路径在不同版本返回结构不同
+ * （官方 OpenAPI 里 trend 系列返回 **array**，access/attack 系列返回 object），
+ * 探测逻辑必须能优雅跳过结构不匹配的候选，而不是把整页打挂。
+ *
+ * @param deep 为 true 时，data 是数组则取数组里第一个对象元素。
+ *             用于容忍「汇总值被包在数组里」的版本差异。
+ */
+private fun dataObjOrNull(body: JsonObject?, deep: Boolean = false): JsonObject? {
+    val data = runCatching { Resp.unwrap(body) }.getOrNull() ?: return null
+    if (data.isJsonObject) return data.asJsonObject
+    if (deep && data.isJsonArray) return Resp.firstObj(data)
+    return null
+}

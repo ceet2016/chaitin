@@ -123,8 +123,8 @@ class SitesVm : ViewModel() {
             if (!silent || !hasData) state = UiState.Loading
             state = try {
                 val body = ApiClient.apiFor(account).sites(mapOf("page" to "1", "page_size" to "100"))
-                val raw = Resp.obj(body)
-                val list = Resp.nodes(raw).ifEmpty { Resp.arr(body) }
+                // listOf 按 data 的真实类型三态分派，能兜住「data 变成裸数组」的版本差异
+                val list = Resp.listOf(body)
                 if (my != epoch) return@launch
                 UiState.Success(list.map { parse(it) })
             } catch (e: Exception) {
@@ -440,13 +440,26 @@ class SiteDetailVm : ViewModel() {
     var state: UiState<JsonObject> by mutableStateOf(UiState.Idle)
         private set
 
+    /**
+     * 请求代次。
+     * 同一个 NavBackStackEntry 复用同一个 ViewModel 时（站点 A → 返回 → 站点 B），
+     * 两次 load 会竞态：慢的 A 会覆盖快的 B，详情页显示成另一个站点的配置 ——
+     * 用户以为在改 A 的域名，实际写的是 B。
+     */
+    private var epoch = 0
+
     fun load(account: AccountProfile, id: Long) {
+        val my = ++epoch
         viewModelScope.launch {
+            if (my != epoch) return@launch
             state = UiState.Loading
             state = try {
                 val raw = Resp.obj(ApiClient.apiFor(account).site(id))
+                if (my != epoch) return@launch
                 UiState.Success(raw)
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (my != epoch) return@launch
                 UiState.Fail(e.readable(), e is com.uniomo.wafce.core.UnauthorizedException)
             }
         }

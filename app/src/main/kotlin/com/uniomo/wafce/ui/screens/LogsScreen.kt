@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -15,24 +16,34 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -46,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -96,6 +108,20 @@ enum class LogKind(val label: String, val color: androidx.compose.ui.graphics.Co
     }
 }
 
+/**
+ * 攻击日志的时间窗。
+ *
+ * 对应 /open/records 的 start / end —— 注意这两个参数是**毫秒**时间戳，
+ * 传秒会得到 0 条（已实测），因此这里统一按 seconds 保存、请求时再 ×1000。
+ */
+enum class LogTimeRange(val label: String, val seconds: Long) {
+    ALL("全部", 0),
+    H1("近 1 小时", 3_600),
+    H24("近 24 小时", 86_400),
+    D7("近 7 天", 604_800),
+    D30("近 30 天", 2_592_000)
+}
+
 private val LOG_TABS = LogKind.entries.map { it.label }
 
 data class LogEntry(
@@ -110,6 +136,18 @@ class LogsVm : ViewModel() {
 
     var tab by mutableIntStateOf(0)
     var page by mutableIntStateOf(1)
+        private set
+
+    /** 分页大小：服务端上限 100，200 会直接 400 */
+    var pageSize by mutableIntStateOf(20)
+        private set
+
+    /** 攻击事件筛选条件（仅 EVENT 页签生效） */
+    var filterIp by mutableStateOf("")
+        private set
+    var filterHost by mutableStateOf("")
+        private set
+    var timeRange by mutableStateOf(LogTimeRange.ALL)
         private set
     var refreshing by mutableStateOf(false)
         private set
@@ -133,6 +171,9 @@ class LogsVm : ViewModel() {
     /** 分页结果缓存：切回已看过的页时立即出内容，避免每次都转圈 */
     private val cache = java.util.concurrent.ConcurrentHashMap<Triple<Long, Int, Int>, List<LogEntry>>()
 
+    /** accountId -> (siteId -> 站点展示名)，详情里把 site_uuid 换成可读名称 */
+    private val siteNameCache = java.util.concurrent.ConcurrentHashMap<Long, Map<String, String>>()
+
     /**
      * 请求代次。
      *
@@ -152,6 +193,10 @@ class LogsVm : ViewModel() {
         // 不再读可变状态，从根上消除竞态
         val myTab = tab
         val myPage = page
+        val mySize = pageSize
+        val myIp = filterIp.trim()
+        val myHost = filterHost.trim()
+        val myRange = timeRange
         val myEpoch = ++epoch
 
         cache[Triple(account.id, myTab, myPage)]?.let { cached ->
@@ -164,10 +209,25 @@ class LogsVm : ViewModel() {
             error = null
             try {
                 val api = ApiClient.apiFor(account)
-                val q = mapOf("page" to myPage.toString(), "page_size" to "20")
                 val k = LogKind.of(myTab)
+                val q = buildMap {
+                    put("page", myPage.toString())
+                    put("page_size", mySize.toString())
+                    if (k == LogKind.EVENT) {
+                        if (myIp.isNotBlank()) put("ip", myIp)
+                        if (myHost.isNotBlank()) put("host", myHost)
+                        // start/end 必须是毫秒；传秒服务端返回 0 条，看起来像「没有攻击」
+                        if (myRange.seconds > 0) {
+                            val nowMs = System.currentTimeMillis()
+                            put("start", (nowMs - myRange.seconds * 1000L).toString())
+                            put("end", nowMs.toString())
+                        }
+                    }
+                }
                 val body = when (k) {
-                    LogKind.EVENT -> api.events(q)
+                    // 9.4.x：请求级攻击日志在 /open/records；
+                    // /open/events 只是 IP+Host 的会话聚合，没有 URL/方法等详情字段
+                    LogKind.EVENT -> api.records(q)
                     LogKind.ACL -> api.recordsAcl(q)
                     LogKind.CHALLENGE -> api.recordsChallenge(q)
                     LogKind.AUTH -> api.recordsAuthDefense(q)
@@ -205,35 +265,103 @@ class LogsVm : ViewModel() {
     fun next(account: AccountProfile) { page += 1; load(account) }
     fun prev(account: AccountProfile) { if (page > 1) page -= 1; load(account) }
 
+    /** 应用筛选：页码回到 1，并清掉旧条件下的分页缓存 */
+    fun applyFilter(
+        account: AccountProfile,
+        ip: String,
+        host: String,
+        range: LogTimeRange,
+        size: Int
+    ) {
+        filterIp = ip.trim()
+        filterHost = host.trim()
+        timeRange = range
+        pageSize = size.coerceIn(20, 100)
+        page = 1
+        cache.clear()
+        load(account)
+    }
+
+    fun setPageSize(account: AccountProfile, size: Int) {
+        val safe = size.coerceIn(20, 100)
+        if (safe == pageSize) return
+        pageSize = safe
+        page = 1
+        cache.clear()
+        load(account)
+    }
+
+    fun clearFilter(account: AccountProfile) {
+        filterIp = ""
+        filterHost = ""
+        timeRange = LogTimeRange.ALL
+        page = 1
+        cache.clear()
+        load(account)
+    }
+
+    /** 筛选条上的一行摘要；空串表示当前没有任何筛选 */
+    fun filterSummary(): String = listOfNotNull(
+        filterIp.takeIf { it.isNotBlank() }?.let { "IP $it" },
+        filterHost.takeIf { it.isNotBlank() },
+        timeRange.takeIf { it != LogTimeRange.ALL }?.label
+    ).joinToString(" · ")
+
     fun closeDetail() { _detail.value = null }
 
     /**
      * 打开详情。
      *
-     * 攻击事件（/open/events）列表返回的是精简字段，真正的详情要再打
-     * /open/events/{id} 才能拿到攻击类型、命中规则、请求报文等；
-     * 其余日志列表本身就是完整记录，直接展示即可。
+     * 攻击日志（/open/records）列表只返回列表级字段，完整的方法、URL、请求头、
+     * 请求体、响应等要再打 /open/record/{event_id}（UUID）。
+     * 早期实现用的是 /open/events/{id}：该路径在 9.4.3 已不存在，而且 events
+     * 本身是「IP+Host 会话聚合」，没有这些字段，所以详情只能看到列表里的概要。
      */
     fun openDetail(account: AccountProfile, entry: LogEntry) {
         _detail.value = entry.raw
         detailFromServer = false
-        if (kind() != LogKind.EVENT || entry.id.isBlank() || entry.id == "0") return
+        if (kind() != LogKind.EVENT) return
+
+        val detailId = Resp.str(entry.raw, "event_id", "EventId").ifBlank { entry.id }
+        if (detailId.isBlank() || detailId == "0") return
 
         detailLoading = true
         viewModelScope.launch {
-            val fetched = runCatching {
-                Resp.obj(ApiClient.apiFor(account).eventDetail(entry.id))
-            }.getOrNull()
+            val api = ApiClient.apiFor(account)
+            // 新版本走 record/{uuid}；老版本 events 的数字 id 再回退旧路径
+            val fetched = runCatching { Resp.obj(api.recordDetail(detailId)) }.getOrNull()
+                ?: detailId.takeIf { it.all(Char::isDigit) }
+                    ?.let { runCatching { Resp.obj(api.eventDetail(it)) }.getOrNull() }
+
+            val merged = JsonObject()
+            entry.raw.entrySet().forEach { (k, v) -> merged.add(k, v) }
+            fetched?.entrySet()?.forEach { (k, v) -> merged.add(k, v) }
+
+            val siteId = Resp.str(merged, "site_uuid", "site_id")
+            val siteName = runCatching { siteNameOf(account, siteId) }.getOrDefault("")
+            if (siteName.isNotBlank()) merged.addProperty("site_name", siteName)
+
             detailLoading = false
-            if (fetched != null && fetched.size() > 0) {
-                // 服务端详情为准，但保留列表里独有的字段（如列表侧的 host 展示名）
-                val merged = JsonObject()
-                entry.raw.entrySet().forEach { (k, v) -> merged.add(k, v) }
-                fetched.entrySet().forEach { (k, v) -> merged.add(k, v) }
-                _detail.value = merged
-                detailFromServer = true
-            }
+            _detail.value = merged
+            detailFromServer = fetched != null && fetched.size() > 0
         }
+    }
+
+    /** 站点 id -> 展示名（备注名优先，没有就用第一个域名）；每个账号只拉一次 */
+    private suspend fun siteNameOf(account: AccountProfile, siteId: String): String {
+        if (siteId.isBlank()) return ""
+        val names = siteNameCache[account.id] ?: runCatching {
+            Resp.listOf(
+                ApiClient.apiFor(account).sites(mapOf("page" to "1", "page_size" to "200"))
+            ).mapNotNull { o ->
+                val id = Resp.l(o, "id").takeIf { it > 0 } ?: return@mapNotNull null
+                val name = Resp.str(o, "comment").ifBlank {
+                    Resp.strList(o, "server_names", "domains").firstOrNull().orEmpty()
+                }
+                id.toString() to name
+            }.filter { it.second.isNotBlank() }.toMap()
+        }.getOrDefault(emptyMap()).also { if (it.isNotEmpty()) siteNameCache[account.id] = it }
+        return names[siteId].orEmpty()
     }
 
     private fun buildEntry(o: JsonObject): LogEntry {
@@ -267,6 +395,7 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
     // 关键：必须 collectAsState，直接读 StateFlow.value 不会触发重组，
     // 会导致弹窗「点不开 / 关不掉」
     val detail by vm.detail.collectAsState()
+    var filterOpen by remember { mutableStateOf(false) }
 
     DisposableEffect(account.id, initialTab) {
         // key 带上 initialTab：深链进入时首次加载就直接按目标页签发起，
@@ -302,6 +431,11 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
                     text = { Text(t, style = MaterialTheme.typography.labelMedium) }
                 )
             }
+        }
+
+        // 只有攻击事件支持 IP / 域名 / 时间筛选；其余页签接口参数不同，不显示
+        if (vm.kind() == LogKind.EVENT) {
+            EventFilterBar(vm, account) { filterOpen = true }
         }
 
         Row(
@@ -364,6 +498,153 @@ fun LogsScreen(account: AccountProfile, initialTab: Int = -1) {
             loading = vm.detailLoading,
             enhanced = vm.detailFromServer,
             onDismiss = { vm.closeDetail() }
+        )
+    }
+
+    if (filterOpen) {
+        EventFilterSheet(vm, account) { filterOpen = false }
+    }
+}
+
+@Composable
+private fun EventFilterBar(vm: LogsVm, account: AccountProfile, onOpen: () -> Unit) {
+    var sizeMenu by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TextButton(onClick = onOpen) {
+            Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("筛选", style = MaterialTheme.typography.labelMedium)
+        }
+        Text(
+            vm.filterSummary().ifBlank { "全部记录" },
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        Row {
+            TextButton(onClick = { sizeMenu = true }) {
+                Text("${vm.pageSize} 条/页", style = MaterialTheme.typography.labelSmall)
+            }
+            DropdownMenu(expanded = sizeMenu, onDismissRequest = { sizeMenu = false }) {
+                listOf(20, 50, 100).forEach { n ->
+                    DropdownMenuItem(
+                        text = { Text("$n 条/页") },
+                        onClick = {
+                            sizeMenu = false
+                            vm.setPageSize(account, n)
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EventFilterSheet(vm: LogsVm, account: AccountProfile, onDismiss: () -> Unit) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var ip by remember { mutableStateOf(vm.filterIp) }
+    var host by remember { mutableStateOf(vm.filterHost) }
+    var range by remember { mutableStateOf(vm.timeRange) }
+    var size by remember { mutableStateOf(vm.pageSize) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 28.dp)
+        ) {
+            Text("筛选攻击事件", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = ip,
+                onValueChange = { ip = it },
+                label = { Text("攻击 IP") },
+                placeholder = { Text("支持前缀，如 223.87") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = host,
+                onValueChange = { host = it },
+                label = { Text("域名") },
+                placeholder = { Text("精确匹配，如 api.example.com") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(Modifier.height(16.dp))
+            Text("时间范围", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LogTimeRange.entries.take(3).forEach { r ->
+                    FilterChoice(r.label, range == r) { range = r }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LogTimeRange.entries.drop(3).forEach { r ->
+                    FilterChoice(r.label, range == r) { range = r }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Text("每页条数", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(20, 50, 100).forEach { n ->
+                    FilterChoice("$n 条", size == n) { size = n }
+                }
+            }
+
+            Spacer(Modifier.height(22.dp))
+            Row(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = {
+                        ip = ""
+                        host = ""
+                        range = LogTimeRange.ALL
+                        size = 20
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("重置") }
+                Spacer(Modifier.width(12.dp))
+                Button(
+                    onClick = {
+                        vm.applyFilter(account, ip, host, range, size)
+                        onDismiss()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("应用") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FilterChoice(text: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(9.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer
+        else MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
         )
     }
 }
@@ -475,9 +756,12 @@ private fun LogDetailDialog(
                         }
                         KeyValueRow("来源 IP", Resp.str(raw, "src_ip", "ip", "client_ip", "remote_addr").ifBlank { "—" })
                         KeyValueRow("目标 Host", Resp.str(raw, "host", "server_name", "domain", "dst_host").ifBlank { "—" })
-                        KeyValueRow("所属站点", Resp.str(raw, "site_title", "site_name", "site_comment", "website").ifBlank { "—" })
+                        KeyValueRow("所属站点", Resp.str(raw, "site_name", "site_title", "site_comment").ifBlank {
+                            Resp.str(raw, "site_uuid", "site_id")
+                                .takeIf { it.isNotBlank() }?.let { "站点 #$it" } ?: "—"
+                        })
                         KeyValueRow("请求方法", Resp.str(raw, "method", "http_method").ifBlank { "—" })
-                        KeyValueRow("请求 URL", Resp.str(raw, "url", "uri", "path", "request_path", "url_path").ifBlank { "—" })
+                        KeyValueRow("请求 URL", Resp.str(raw, "website", "url", "uri", "request_path", "url_path").ifBlank { "—" })
                         KeyValueRow("状态码", Resp.l(raw, "status_code", "status", "code").takeIf { it > 0 }?.toString() ?: "—")
                         KeyValueRow("归属地区", Resp.str(raw, "province", "region", "country", "location").ifBlank { "—" })
                     }
@@ -496,7 +780,13 @@ private fun LogDetailDialog(
                 val req = groups.firstOrNull { it.first == "request" }
                 if (req != null && req.second.isNotEmpty()) {
                     GroupCard("请求内容")
-                    req.second.forEach { (k, v) -> KeyValueRow(REQUEST_LABELS[k] ?: k, v, InfoColor) }
+                    req.second.forEach { (k, v) ->
+                        if (k.lowercase() in RAW_BLOCK_KEYS) {
+                            BodyBlock(REQUEST_LABELS[k] ?: k, v)
+                        } else {
+                            KeyValueRow(REQUEST_LABELS[k] ?: k, v, InfoColor)
+                        }
+                    }
                     Spacer(Modifier.height(12.dp))
                 }
 
@@ -616,7 +906,7 @@ private val REQUEST_KEYS = setOf(
     "user_agent", "useragent", "referer", "referrer", "cookie", "request_body",
     "req_body", "body", "query", "query_string", "headers", "req_header",
     "rsp_header", "rsp_body", "attack_detail", "req_id", "trace_id",
-    "x_forwarded_for", "decode_path", "method", "http_method", "status_code",
+    "x_forwarded_for", "decode_path",
     "ja4_fingerprint", "protocol", "dst_port", "src_port", "dst_ip"
 )
 
@@ -630,7 +920,7 @@ private val SKIP_KEYS = setOf(
     "src_ip", "ip", "client_ip", "remote_addr", "source_ip", "socket_ip",
     "host", "server_name", "domain", "dst_host", "server", "website",
     "url", "uri", "path", "request_path", "url_path",
-    "status_code", "status", "code",
+    "status_code", "status", "code", "method", "http_method",
     "province", "region", "country", "location", "city", "lat", "lng",
     "id", "uid", "uuid", "event_id", "eventid",
     "site_id", "site_uuid", "site_title", "site_name", "site_comment",
@@ -708,6 +998,158 @@ private val REQUEST_LABELS = mapOf(
     "dst_ip" to "目标 IP",
     "x_forwarded_for" to "X-Forwarded-For"
 )
+
+/** 头部/报文类字段按块展示：塞进右对齐的键值行里会把多行内容压变形 */
+private val RAW_BLOCK_KEYS = setOf(
+    "req_header", "rsp_header", "req_body", "rsp_body", "payload",
+    "headers", "request_body", "body", "attack_detail"
+)
+
+/**
+ * 尝试把响应体解成可读文本。
+ *
+ * 雷池返回的 rsp_body 是 Go %q 风格的转义串（如 `\x1f\x8b\b\x00...`），
+ * 也可能直接是原始控制字符。两种形态都先还原成字节，再判断 gzip。
+ * 非 gzip / 解码失败返回 null，调用方继续展示原文。
+ */
+private fun gunzipBody(value: String): String? {
+    if (value.isEmpty() || value.length > 262_144) return null
+    val bytes = when {
+        value.startsWith("\\x1f\\x8b") -> unescapeBody(value) ?: return null
+        value.length >= 2 && value[0].code == 0x1f && value[1].code == 0x8b ->
+            value.toByteArray(Charsets.ISO_8859_1)
+        else -> return null
+    }
+    if (bytes.size < 4 || bytes[0] != 0x1f.toByte() || bytes[1] != 0x8b.toByte()) return null
+    return runCatching {
+        java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(bytes))
+            .bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }.getOrNull()
+}
+
+/** 解析 `\x1f`、`\b`、`\n` 这类转义；注意 `\x` 后的十六进制可能是 1~2 位 */
+private fun unescapeBody(s: String): ByteArray? {
+    val out = java.io.ByteArrayOutputStream(s.length)
+    val hex = "0123456789abcdefABCDEF"
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (c == '\\' && i + 1 < s.length) {
+            val n = s[i + 1]
+            if (n == 'x') {
+                var j = i + 2
+                var h = ""
+                while (j < s.length && h.length < 2 && s[j] in hex) {
+                    h += s[j]; j++
+                }
+                if (h.isEmpty()) {
+                    out.write(n.code); i += 2; continue
+                }
+                out.write(h.toInt(16)); i = j; continue
+            }
+            val b = when (n) {
+                'b' -> 8
+                't' -> 9
+                'n' -> 10
+                'f' -> 12
+                'r' -> 13
+                '\\' -> 92
+                '"' -> 34
+                else -> n.code
+            }
+            out.write(b); i += 2
+        } else {
+            if (c.code < 256) out.write(c.code)
+            else out.write(c.toString().toByteArray(Charsets.UTF_8))
+            i++
+        }
+    }
+    return out.toByteArray()
+}
+
+/**
+ * 请求/响应报文块。
+ *
+ * 检测到 gzip 时在右上角提供「原始数据 / gzip 解码」切换；
+ * 普通文本没有可切换的内容，仍走原来的单块展示。
+ */
+@Composable
+private fun BodyBlock(label: String, raw: String) {
+    val decoded = remember(raw) { gunzipBody(raw) }
+    if (decoded == null) {
+        RawBlock(label, raw)
+        return
+    }
+    var showDecoded by remember(raw) { mutableStateOf(true) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+            BodyTab("原始数据", !showDecoded) { showDecoded = false }
+            Spacer(Modifier.width(6.dp))
+            BodyTab("gzip 解码", showDecoded) { showDecoded = true }
+        }
+        Spacer(Modifier.height(4.dp))
+        Surface(
+            shape = CardShape,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                if (showDecoded) decoded else raw,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.fillMaxWidth().padding(10.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun BodyTab(text: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(7.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer
+        else MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun RawBlock(label: String, text: String) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(4.dp))
+        Surface(
+            shape = CardShape,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.fillMaxWidth().padding(10.dp)
+            )
+        }
+    }
+}
 
 private val OTHER_LABELS = mapOf(
     "action" to "处置动作",

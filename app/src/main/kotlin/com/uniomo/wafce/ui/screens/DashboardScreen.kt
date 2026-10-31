@@ -1,6 +1,7 @@
 package com.uniomo.wafce.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -620,24 +621,35 @@ private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
                 subtitle = data.summaryWindow.ifBlank { "统计窗口以服务端为准" }
             ) {
                 Column {
-                    Row(Modifier.fillMaxWidth()) {
-                        if (accessSum != null) {
-                            FlowMetric("请求次数", fmt.format(accessSum.requests), Brand, Modifier.weight(1f))
+                    // 第一行：访问侧（PV / UV / 独立 IP）
+                    if (accessSum != null) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
                             FlowMetric("访问 PV", fmt.format(accessSum.pageViews), InfoColor, Modifier.weight(1f))
                             FlowMetric("访客 UV", fmt.format(accessSum.uniqueVisitors), Ok, Modifier.weight(1f))
                             FlowMetric("独立 IP", fmt.format(accessSum.uniqueIps), Warn, Modifier.weight(1f))
-                        } else if (interceptSum != null) {
+                        }
+                    }
+                    // 第二行：请求量 / 拦截侧
+                    if (interceptSum != null) {
+                        if (accessSum != null) Spacer(Modifier.height(14.dp))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            if (accessSum != null) {
+                                FlowMetric(
+                                    "请求次数", fmt.format(accessSum.requests), Brand, Modifier.weight(1f)
+                                )
+                            }
                             FlowMetric(
                                 "拦截次数", fmt.format(interceptSum.intercept), Danger, Modifier.weight(1f)
                             )
-                        }
-                    }
-                    if (accessSum != null && interceptSum != null) {
-                        Spacer(Modifier.height(10.dp))
-                        Row(Modifier.fillMaxWidth()) {
-                            FlowMetric("拦截次数", fmt.format(interceptSum.intercept), Danger, Modifier.weight(1f))
-                            FlowMetric("攻击 IP", fmt.format(interceptSum.attackIps), Warn, Modifier.weight(1f))
-                            Spacer(Modifier.weight(2f))
+                            FlowMetric(
+                                "攻击 IP", fmt.format(interceptSum.attackIps), Warn, Modifier.weight(1f)
+                            )
                         }
                     }
                 }
@@ -657,15 +669,24 @@ private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
                 subtitle = data.summaryWindow.ifBlank { "统计窗口以服务端为准" }
             ) {
                 Column {
-                    Row(Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
                         FlowMetric("4xx 错误数", fmt.format(errSum.error4xx), Warn, Modifier.weight(1f))
-                        FlowMetric("5xx 错误数", fmt.format(errSum.error5xx), Danger, Modifier.weight(1f))
                         FlowMetric(
                             "4xx 错误率",
                             if (totalReq > 0L) pct(errSum.error4xx, totalReq) else "—",
                             Warn,
                             Modifier.weight(1f)
                         )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        FlowMetric("5xx 错误数", fmt.format(errSum.error5xx), Danger, Modifier.weight(1f))
                         FlowMetric(
                             "5xx 错误率",
                             if (totalReq > 0L) pct(errSum.error5xx, totalReq) else "—",
@@ -674,7 +695,7 @@ private fun Content(data: DashboardData, onNavigate: (DashTarget) -> Unit) {
                         )
                     }
                     if (totalReq <= 0L) {
-                        Spacer(Modifier.height(6.dp))
+                        Spacer(Modifier.height(8.dp))
                         Text(
                             "错误率需要请求次数作为分母，当前实例未提供该统计",
                             style = MaterialTheme.typography.labelSmall,

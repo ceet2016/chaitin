@@ -212,7 +212,23 @@ interface SafeLineApi {
 
     // ===================== 日志与查询 =====================
 
-    /** 攻击事件 */
+    /**
+     * 攻击日志（请求级）。9.4.x 的列表字段最全：method/url_path/status_code/
+     * site_uuid/event_id 以及请求头、请求体、响应头等都在这里。
+     * 筛选参数：start / end / host / ip / url / port / ja4_fingerprint / action / attack_type / event_id。
+     */
+    @GET("api/open/records")
+    suspend fun records(@QueryMap q: Map<String, String>): JsonObject
+
+    /**
+     * 攻击日志详情，id 取 records 返回的 `event_id`（UUID 字符串）。
+     * 注意不是 `/open/events/{id}` —— 后者在 9.4.3 上已不存在，且 events 是
+     * 按 IP+Host 聚合的会话，本身没有 URL/方法等字段。
+     */
+    @GET("api/open/record/{id}")
+    suspend fun recordDetail(@Path("id") id: String): JsonObject
+
+    /** 攻击会话（按 IP + Host 聚合），保留用于概览计数 */
     @GET("api/open/events")
     suspend fun events(@QueryMap q: Map<String, String>): JsonObject
 

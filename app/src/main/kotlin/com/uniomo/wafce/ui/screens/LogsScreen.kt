@@ -122,6 +122,13 @@ enum class LogTimeRange(val label: String, val seconds: Long) {
     D30("近 30 天", 2_592_000)
 }
 
+/** 攻击日志的处置结果：records.action 0=放行 1=拦截（已实测） */
+enum class LogActionFilter(val label: String, val value: String?) {
+    ALL("全部", null),
+    ALLOW("放行", "0"),
+    BLOCK("拦截", "1")
+}
+
 private val LOG_TABS = LogKind.entries.map { it.label }
 
 data class LogEntry(
@@ -129,6 +136,8 @@ data class LogEntry(
     val title: String,
     val subtitle: String,
     val attrLine: String,
+    /** 攻击日志的处置结果：0 放行 / 1 拦截 / 2 人机验证；其他日志为 -1 */
+    val action: Int,
     val raw: JsonObject
 )
 
@@ -148,6 +157,8 @@ class LogsVm : ViewModel() {
     var filterHost by mutableStateOf("")
         private set
     var timeRange by mutableStateOf(LogTimeRange.ALL)
+        private set
+    var actionFilter by mutableStateOf(LogActionFilter.BLOCK)
         private set
     var refreshing by mutableStateOf(false)
         private set
@@ -197,6 +208,7 @@ class LogsVm : ViewModel() {
         val myIp = filterIp.trim()
         val myHost = filterHost.trim()
         val myRange = timeRange
+        val myAction = actionFilter
         val myEpoch = ++epoch
 
         cache[Triple(account.id, myTab, myPage)]?.let { cached ->
@@ -216,6 +228,7 @@ class LogsVm : ViewModel() {
                     if (k == LogKind.EVENT) {
                         if (myIp.isNotBlank()) put("ip", myIp)
                         if (myHost.isNotBlank()) put("host", myHost)
+                        myAction.value?.let { put("action", it) }
                         // start/end 必须是毫秒；传秒服务端返回 0 条，看起来像「没有攻击」
                         if (myRange.seconds > 0) {
                             val nowMs = System.currentTimeMillis()
@@ -270,11 +283,13 @@ class LogsVm : ViewModel() {
         account: AccountProfile,
         ip: String,
         host: String,
+        action: LogActionFilter,
         range: LogTimeRange,
         size: Int
     ) {
         filterIp = ip.trim()
         filterHost = host.trim()
+        actionFilter = action
         timeRange = range
         pageSize = size.coerceIn(20, 100)
         page = 1
@@ -294,6 +309,7 @@ class LogsVm : ViewModel() {
     fun clearFilter(account: AccountProfile) {
         filterIp = ""
         filterHost = ""
+        actionFilter = LogActionFilter.BLOCK
         timeRange = LogTimeRange.ALL
         page = 1
         cache.clear()
@@ -304,6 +320,7 @@ class LogsVm : ViewModel() {
     fun filterSummary(): String = listOfNotNull(
         filterIp.takeIf { it.isNotBlank() }?.let { "IP $it" },
         filterHost.takeIf { it.isNotBlank() },
+        actionFilter.takeIf { it != LogActionFilter.ALL }?.label,
         timeRange.takeIf { it != LogTimeRange.ALL }?.label
     ).joinToString(" · ")
 
@@ -378,12 +395,25 @@ class LogsVm : ViewModel() {
         if (status > 0) subtitleParts.add("HTTP $status")
         val region = Resp.str(o, "province", "region", "country", "location")
         if (region.isNotBlank()) subtitleParts.add(region)
+
+        val rawAction = Resp.l(o, "action").toInt()
+        val isEvent = kind() == LogKind.EVENT
+        // 列表里直接标出处置结果：仅靠颜色区分对色弱用户不友好
+        val actionLabel = if (isEvent) when (rawAction) {
+            0 -> "放行"
+            1 -> "拦截"
+            2 -> "人机验证"
+            else -> ""
+        } else ""
+
         return LogEntry(
             id = Resp.str(o, "id", "uid", "uuid", "event_id").ifBlank { Resp.l(o, "id").toString() },
             title = hostPair ?: ip.ifBlank { "记录 ${System.currentTimeMillis()}" },
             subtitle = subtitleParts.joinToString(" · "),
             // 时间统一走 TimeFmt：各接口的 timestamp(int) 与 created_at(string) 都能读成人能看懂的格式
-            attrLine = listOf(rule, TimeFmt.logTimeOf(o)).filter { it.isNotBlank() }.joinToString(" · "),
+            attrLine = listOf(actionLabel, rule, TimeFmt.logTimeOf(o))
+                .filter { it.isNotBlank() }.joinToString(" · "),
+            action = if (isEvent) rawAction else -1,
             raw = o
         )
     }
@@ -551,6 +581,7 @@ private fun EventFilterSheet(vm: LogsVm, account: AccountProfile, onDismiss: () 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var ip by remember { mutableStateOf(vm.filterIp) }
     var host by remember { mutableStateOf(vm.filterHost) }
+    var action by remember { mutableStateOf(vm.actionFilter) }
     var range by remember { mutableStateOf(vm.timeRange) }
     var size by remember { mutableStateOf(vm.pageSize) }
 
@@ -599,6 +630,15 @@ private fun EventFilterSheet(vm: LogsVm, account: AccountProfile, onDismiss: () 
             }
 
             Spacer(Modifier.height(16.dp))
+            Text("处置结果", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LogActionFilter.entries.forEach { a ->
+                    FilterChoice(a.label, action == a) { action = a }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
             Text("每页条数", style = MaterialTheme.typography.labelMedium)
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -613,6 +653,7 @@ private fun EventFilterSheet(vm: LogsVm, account: AccountProfile, onDismiss: () 
                     onClick = {
                         ip = ""
                         host = ""
+                        action = LogActionFilter.BLOCK
                         range = LogTimeRange.ALL
                         size = 20
                     },
@@ -621,7 +662,7 @@ private fun EventFilterSheet(vm: LogsVm, account: AccountProfile, onDismiss: () 
                 Spacer(Modifier.width(12.dp))
                 Button(
                     onClick = {
-                        vm.applyFilter(account, ip, host, range, size)
+                        vm.applyFilter(account, ip, host, action, range, size)
                         onDismiss()
                     },
                     modifier = Modifier.weight(1f)
@@ -651,6 +692,12 @@ private fun FilterChoice(text: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun LogRowView(entry: LogEntry, onClick: () -> Unit) {
+    // 放行黄、拦截红；其他日志没有 action，保持原来的黄色
+    val attrColor = when (entry.action) {
+        1 -> Danger
+        2 -> InfoColor
+        else -> Warn
+    }
     Card(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp),
         shape = CardShape,
@@ -685,7 +732,7 @@ private fun LogRowView(entry: LogEntry, onClick: () -> Unit) {
                 Text(
                     entry.attrLine,
                     style = MaterialTheme.typography.labelSmall,
-                    color = Warn
+                    color = attrColor
                 )
             }
         }
@@ -857,6 +904,59 @@ private fun GroupCard(title: String) {
 }
 
 /**
+ * 攻击类型中文名，取自雷池控制台前端语言包（attack.type.*）。
+ * 负数是黑白名单/非攻击等特殊分类，不要遗漏。
+ */
+private val ATTACK_TYPE_NAMES = mapOf(
+    -4 to "超长数据", -3 to "黑名单", -2 to "白名单", -1 to "非攻击",
+    0 to "SQL 注入", 1 to "XSS", 2 to "CSRF", 3 to "SSRF", 4 to "拒绝服务",
+    5 to "后门", 6 to "反序列化", 7 to "代码执行", 8 to "代码注入", 9 to "命令注入",
+    10 to "文件上传", 11 to "文件包含", 12 to "重定向", 13 to "权限不当", 14 to "信息泄露",
+    15 to "未授权访问", 16 to "不安全的配置", 17 to "XXE", 18 to "XPath 注入",
+    19 to "LDAP 注入", 20 to "目录穿越", 21 to "扫描器", 22 to "水平权限绕过",
+    23 to "垂直权限绕过", 24 to "文件修改", 25 to "文件读取", 26 to "文件删除",
+    27 to "逻辑错误", 28 to "CRLF 注入", 29 to "模板注入", 30 to "点击劫持",
+    31 to "缓冲区溢出", 32 to "整数溢出", 33 to "格式化字符串", 34 to "条件竞争",
+    35 to "HTTP 协议违规", 36 to "HTTP 请求走私", 61 to "超时", 62 to "未知",
+    63 to "威胁情报", 64 to "Cookie 篡改"
+)
+
+private fun attackTypeName(value: String): String =
+    value.trim().toIntOrNull()?.let { ATTACK_TYPE_NAMES[it] } ?: value
+
+/** 防护模块代码 -> 中文名，同样取自控制台前端语言包（module.*） */
+private val MODULE_NAMES = mapOf(
+    "blacklist" to "黑名单",
+    "whitelist" to "白名单",
+    "m_asp_code_injection" to "ASP 代码注入检测",
+    "m_cmd_injection" to "命令注入检测",
+    "m_csrf" to "CSRF 检测",
+    "m_file_include" to "文件包含检测",
+    "m_file_upload" to "文件上传检测",
+    "m_http" to "畸形 HTTP 协议检测",
+    "m_java" to "JAVA 代码注入检测",
+    "m_java_unserialize" to "JAVA 反序列化检测",
+    "m_php_code_injection" to "PHP 代码注入检测",
+    "m_php_unserialize" to "PHP 反序列化检测",
+    "m_response" to "服务器响应检测",
+    "m_rule" to "加强规则",
+    "m_scanner" to "机器人检测",
+    "m_sqli" to "SQL 注入检测",
+    "m_ssrf" to "SSRF 检测",
+    "m_ssti" to "模板注入检测",
+    "m_timeout" to "检测超时",
+    "m_xss" to "XSS 检测"
+)
+
+/** 服务端 reason 形如「检测到 0 攻击」，把里面的类型编号翻成中文 */
+private fun localizeReason(text: String): String =
+    Regex("""检测到\s*(-?\d+)\s*攻击""").replace(text) { m ->
+        val name = m.groupValues[1].toIntOrNull()?.let { ATTACK_TYPE_NAMES[it] } ?: return@replace m.value
+        val sep = if ((name.lastOrNull()?.code ?: 0) < 128) " " else ""
+        "检测到 $name${sep}攻击"
+    }
+
+/**
  * 把原始 JSON 按语义分成三组，避免所有字段平铺导致关键信息被淹没。
  * 返回 Pair<分组名, 字段列表>，分组名取值：attack / request / other。
  */
@@ -880,11 +980,20 @@ private fun groupize(raw: JsonObject): List<Pair<String, List<Pair<String, Strin
         }
         if (text.isBlank()) continue
 
+        // 攻击类型是数字、命中原因里也嵌着类型编号，展示前统一转中文
+        val display = when (key) {
+            "attack_type" -> attackTypeName(text)
+            "module" -> MODULE_NAMES[text] ?: text
+            "reason" -> localizeReason(text)
+            else -> text
+        }
+        if (display.isBlank()) continue
+
         when {
-            key in ATTACK_KEYS -> attack.add(k to text)
-            key in REQUEST_KEYS -> request.add(k to text)
+            key in ATTACK_KEYS -> attack.add(k to display)
+            key in REQUEST_KEYS -> request.add(k to display)
             key in SKIP_KEYS -> Unit
-            else -> other.add(k to text)
+            else -> other.add(k to display)
         }
     }
     return listOf("attack" to attack, "request" to request, "other" to other)

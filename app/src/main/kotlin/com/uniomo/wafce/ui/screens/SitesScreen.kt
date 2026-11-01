@@ -85,8 +85,14 @@ data class SiteItem(
     val upstreams: List<String>,
     val comment: String,
     val certId: Long,
+    /** 今日请求数（站点列表的 req_value，随时间增长，控制台同源） */
+    val todayRequests: Long,
+    /** 今日拦截数（denied_value） */
+    val todayBlocked: Long,
     val raw: JsonObject
 )
+
+private val COUNT_FMT = java.text.DecimalFormat("#,###")
 
 class SitesVm : ViewModel() {
 
@@ -221,6 +227,8 @@ class SitesVm : ViewModel() {
             upstreams = ups,
             comment = Resp.str(o, "comment", "remark", "desc"),
             certId = Resp.l(o, "cert_id", "ssl_id", "certificate_id"),
+            todayRequests = Resp.l(o, "req_value", "today_req", "request_count"),
+            todayBlocked = Resp.l(o, "denied_value", "today_denied", "deny_count"),
             raw = o
         )
     }
@@ -354,6 +362,15 @@ private fun SiteRow(site: SiteItem, onOpen: () -> Unit, onEdit: () -> Unit, onDe
                     overflow = TextOverflow.Ellipsis
                 )
             }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                SiteStat("今日请求", COUNT_FMT.format(site.todayRequests), Brand)
+                SiteStat(
+                    "今日拦截",
+                    COUNT_FMT.format(site.todayBlocked),
+                    if (site.todayBlocked > 0) Danger else Ok
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 Surface(shape = CardShape, onClick = onEdit) {
@@ -373,6 +390,24 @@ private fun SiteRow(site: SiteItem, onOpen: () -> Unit, onEdit: () -> Unit, onDe
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SiteStat(label: String, value: String, color: androidx.compose.ui.graphics.Color) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.width(5.dp))
+        Text(
+            value,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = color
+        )
     }
 }
 
